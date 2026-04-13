@@ -12,6 +12,37 @@ LIDAR_SENSOR_PATHS = {
 DEFAULT_MAX_RANGE = 5.0                                # Return value when no valid reading (m)
 
 
+def set_lidar_resolution(sim, lidar_handles, resolution):
+    """
+    Attempts to set the resolution of each LiDAR vision sensor.
+
+    Note: This depends on the CoppeliaSim API exposing the
+    vision sensor integer params in the remote API.
+
+    Args:
+        sim: CoppeliaSim remote API object.
+        lidar_handles (dict[str, int]): Sensor handle map.
+        resolution (int | None): Desired square resolution (e.g., 32).
+            If None or <= 0, no change is applied.
+    """
+    if resolution is None or resolution <= 0:
+        return
+
+    try:
+        param_x = sim.visionintparam_resolution_x
+        param_y = sim.visionintparam_resolution_y
+    except Exception:
+        print("  LiDAR resolution change not supported by this API build.")
+        return
+
+    for handle in lidar_handles.values():
+        try:
+            sim.setObjectInt32Param(handle, param_x, int(resolution))
+            sim.setObjectInt32Param(handle, param_y, int(resolution))
+        except Exception as e:
+            print(f"  LiDAR resolution set failed: {e}")
+
+
 def get_lidar_handles(sim, sensor_paths=None):
     """
     Loads all LiDAR sensor handles from CoppeliaSim.
@@ -76,25 +107,6 @@ def get_lidar_min_distance(sim, lidar_handle, max_range=DEFAULT_MAX_RANGE):
         return max_range
 
 
-def read_lidar(sim, lidar_handles):
-    """
-    Reads all LiDAR sensors and returns minimum distances.
-
-    Args:
-        sim: CoppeliaSim remote API object.
-        lidar_handles (dict[str, int]): Mapping of sensor name to
-            its CoppeliaSim object handle.
-
-    Returns:
-        dict[str, float]: Mapping of sensor name to its
-            minimum distance reading.
-    """
-    readings = {}
-    for name, handle in lidar_handles.items():
-        readings[name] = get_lidar_min_distance(sim, handle)
-    return readings
-
-
 def read_lidar_array(sim, lidar_handles):
     """
     Reads all LiDAR sensors and returns distances as a numpy array.
@@ -119,22 +131,3 @@ def read_lidar_array(sim, lidar_handles):
     ], dtype=np.float32)
 
 
-def format_lidar_status(lidar_data):
-    """
-    Returns a formatted string of LiDAR readings.
-
-    Args:
-        lidar_data (dict[str, float | None]): Mapping of sensor name
-            to distance value as returned by ``read_lidar``.
-
-    Returns:
-        str: Pipe-separated status string,
-            e.g. ``"F: 1.23m | B: 2.10m | L: 0.85m | R: N/A"``.
-    """
-    parts = []
-    for name, dist in lidar_data.items():
-        if dist is not None:
-            parts.append(f"{name}: {dist:.2f}m")
-        else:
-            parts.append(f"{name}: N/A")
-    return " | ".join(parts)
