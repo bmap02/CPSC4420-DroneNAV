@@ -61,7 +61,7 @@ python train.py --resume --model models/checkpoints/drone_ppo_10000_steps
 
 ```bash
 cd ~/rl_testing/CPSC4420-DroneNAV
-apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && python3 train.py --final-name drone_ppo_palmetto_v5"
+apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && python3 train.py --final-name drone_ppo_palmetto_v9"
 ```
 
 ## How it works

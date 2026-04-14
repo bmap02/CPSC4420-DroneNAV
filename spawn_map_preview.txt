@@ -1,0 +1,42 @@
+Spawn map: 37x37 grid, step=0.5m
+Bounds: [-9.0, 9.0]
+Safe: 453/1369 (33%)
+
+y=  +9.0 |X . . . . . . . . . . . X X X X X X X . . . X X X X X X X X X X X X X X X 
+y=  +8.5 |. X X X X X X X . . . X X X X X X X X X . . X X X X X X X X X X X X X X X 
+y=  +8.0 |X X X X X X X X X . X X X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +7.5 |X X X X X X X X X X X X X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +7.0 |X X X X X X X X X X X X X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +6.5 |X X X X X X X X X X X X X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +6.0 |X X X X X X X X X X X X X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +5.5 |X X X X X X X X X X X X X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +5.0 |X X X X X X X X X X X X X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +4.5 |X X X X X X X X X X . X X X X X X X X X X X X X X X X X X X X X X X X X X 
+y=  +4.0 |X X X X X X X X X X X . X X X X X X X X X . X X X X X X X X X X X X X X X 
+y=  +3.5 |X X X X X X X X . . . . . . . . . . . . . . X X X X X X X X X X X X X X X 
+y=  +3.0 |. . . X X X X X X . . . . . . . . . . . . . X X X X X X X X X X X X X X X 
+y=  +2.5 |. . . . . . . . . X X X X X X X X . . . . . X X X X X X X X X X X X X X X 
+y=  +2.0 |X . . . . . . . . . . . . . . X X X X X X . X X X X X X X X X X X X X X X 
+y=  +1.5 |. . . . . . . . . . . . . . . . . . . . . . X X X X X X X X X X X X X X X 
+y=  +1.0 |. . . . . . . . . . . . . . . . . . . . . . X X X X X X X X X X X X X X X 
+y=  +0.5 |X . X X X X X X . . . . . . . . . . . . . . X X X X X X X X X X X X X X X 
+y=  +0.0 |. . . . . . X X X X X X X X X . . . . . . . X X X X X X X X X X X X X X X 
+y=  -0.5 |X . . . . X X X X X X X X X X . X X X X X X X X X X X X X X X X X X X X X 
+y=  -1.0 |X X X X X X X X X X X X X X X . . . . . . . X X X X X X X X X X X X X X X 
+y=  -1.5 |X . . . . X X X X X X X X X X . . . . . . . X X X X X X X X X X X X X X X 
+y=  -2.0 |. . . . . X X X X X X X X X X X X X X . . . X X X X X X X X X X X X X X X 
+y=  -2.5 |X . . . . X X X X X X X X X X . . . . . . . X X X X X X X X X X X X X X X 
+y=  -3.0 |X . . . . X X X X X X X X X X . . . . . . . X X X X X X X X X X X X X X X 
+y=  -3.5 |X X X X X X X X X X X X X X X . . . . . . . X X X X X X X X X X X X . X X 
+y=  -4.0 |. . . . . X X X X X X X X X X . . . . . . . X X X X X X X X X X . . . . . 
+y=  -4.5 |X . . . . . X X X X X X X X X . . . . . . . X X X X X X X X X X X X X X X 
+y=  -5.0 |X . . . . . . X X X X X X . . X X X X X X X X X X X X X X X X X . . . . . 
+y=  -5.5 |X . . . . . . . . . . . . . X X X X X X X X X X X X X X X X X . . . . . . 
+y=  -6.0 |. . . . . . . . . . . . . X X X X X X X X X X X . . . . . . . . . . . . . 
+y=  -6.5 |X . . X X . . . . . . . . X X X X X X X X X X X X X X X . . . . . . . . . 
+y=  -7.0 |. . . . . . . . . . . . . X X X X X X X X X X X . . . . X X X X . X . . . 
+y=  -7.5 |X . . . . . . . . . . . . X X X X X X X X X X X . . . . . . . . . . . . . 
+y=  -8.0 |. . . . . . . . . . . . . X X X X X X X X X X X . . . . . . . . . . . . . 
+y=  -8.5 |. . . . . . . . . . . . . X X X X X X X X X X X . . . . . . . . . . . . . 
+y=  -9.0 |. . . . . . . . . . . . . X X X X X X X X X X X . . . . . . . . . . . . . 
+         x=-9    x=-7    x=-5    x=-3    x=-1    x=+1    x=+3    x=+5    x=+7    x=+9    

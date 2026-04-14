@@ -73,6 +73,7 @@ class DroneAvoidanceEnv(gym.Env):
         flight_height,                     # Starting flight height (m)
         ideal_altitude,                    # Ideal cruising altitude (m) — reward for staying near
         exploration_grid_size,             # Size of grid cells for exploration tracking (m)
+        lidar_bins,                        # Angular bins per sensor (1 = legacy, 4 = 16 features)
         # ── Reward weights (required — single source of truth is train.py) ──
         survival_reward,                   # Per-step bonus for staying alive
         exploration_reward,                # One-shot bonus for visiting a new grid cell
@@ -91,9 +92,12 @@ class DroneAvoidanceEnv(gym.Env):
         altitude_linear_scale,             # Linear penalty multiplier inside linear band
         altitude_quadratic_scale,          # Quadratic penalty multiplier outside linear band
         action_smoothness_scale,           # Penalty on ||a_t - a_{t-1}||^2 (0 = disabled)
+        boundary_warning_distance,         # Distance from edge where boundary penalty starts (m)
+        boundary_penalty_scale,            # Multiplier on boundary proximity penalty
         # ── Spawn randomization ──
         randomize_start_pose,              # If True, sample (x, y) each reset
         spawn_margin,                      # Inset from boundary_min/max for spawn area (m)
+        spawn_map_path,                    # Path to spawn_map.npy (None = rejection sampling)
         # ── Sim / IO (required — supplied by train.py) ──
         disable_visualization,             # Toggle visualization off on reset
         lidar_resolution,                  # Vision sensor resolution (square). None to skip
@@ -146,6 +150,7 @@ class DroneAvoidanceEnv(gym.Env):
         self.flight_height = flight_height
         self.ideal_altitude = ideal_altitude
         self.exploration_grid_size = exploration_grid_size
+        self.lidar_bins = lidar_bins
 
         # Reward weights
         self.survival_reward = survival_reward
@@ -165,10 +170,14 @@ class DroneAvoidanceEnv(gym.Env):
         self.altitude_linear_scale = altitude_linear_scale
         self.altitude_quadratic_scale = altitude_quadratic_scale
         self.action_smoothness_scale = action_smoothness_scale
+        self.boundary_warning_distance = boundary_warning_distance
+        self.boundary_penalty_scale = boundary_penalty_scale
 
         # Spawn randomization
         self.randomize_start_pose = randomize_start_pose
         self.spawn_margin = spawn_margin
+        self.spawn_map_path = spawn_map_path
+        self._safe_spawns = None  # loaded lazily on first reset
 
         # Sim / IO
         self.render_mode = render_mode
@@ -181,9 +190,11 @@ class DroneAvoidanceEnv(gym.Env):
         self.cntport = cntport
 
         # Observation space
-        # 4 lidar readings + 3 position + 3 velocity = 10
+        # (4 sensors × lidar_bins) lidar + 3 position + 3 velocity
+        lidar_dim = 4 * self.lidar_bins
+        obs_dim = lidar_dim + 3 + 3
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
 
         # Action space
@@ -197,6 +208,7 @@ class DroneAvoidanceEnv(gym.Env):
         self.sim = None
         self.drone = None
         self.target = None
+        self.flight_script = None
         self.lidar_handles = {}
 
         # ── Episode state ──
@@ -233,6 +245,9 @@ class DroneAvoidanceEnv(gym.Env):
 
         self.drone = self.sim.getObject('/Quadcopter')
         self.target = self.sim.getObject('/target')
+        self.flight_script = self.sim.getScript(
+            self.sim.scripttype_childscript, self.drone, ''
+        )
         self.lidar_handles = get_lidar_handles(self.sim)
 
         self._connected = True
@@ -260,12 +275,13 @@ class DroneAvoidanceEnv(gym.Env):
         single flat array.
 
         Returns:
-            np.ndarray: Shape (10,) float32 observation.
-                [0:4]  — LiDAR distances (F, B, L, R) in metres
-                [4:7]  — Drone position (x, y, z) in metres
-                [7:10] — Drone velocity (vx, vy, vz) in m/s
+            np.ndarray: Shape (4*lidar_bins + 6,) float32 observation.
+                [0 : 4*lidar_bins]  — LiDAR angular bin distances (metres)
+                [... : ...+3]       — Drone position (x, y, z) in metres
+                [...+3 : ...+6]     — Drone velocity (vx, vy, vz) in m/s
         """
-        lidar = read_lidar_array(self.sim, self.lidar_handles)
+        lidar = read_lidar_array(self.sim, self.lidar_handles,
+                                 num_bins=self.lidar_bins)
         pos = get_drone_pos_array(self.sim, self.drone)
         vel = get_drone_velocity(self.sim, self.drone)
 
@@ -325,9 +341,10 @@ class DroneAvoidanceEnv(gym.Env):
                 info (dict): Additional diagnostics about what
                     triggered the reward components.
         """
-        lidar = obs[:4]
-        pos = obs[4:7]
-        vel = obs[7:10]
+        lidar_dim = 4 * self.lidar_bins
+        lidar = obs[:lidar_dim]
+        pos = obs[lidar_dim:lidar_dim + 3]
+        vel = obs[lidar_dim + 3:lidar_dim + 6]
 
         reward = 0.0
         terminated = False
@@ -392,6 +409,16 @@ class DroneAvoidanceEnv(gym.Env):
             terminated = True
             info['out_of_bounds'] = True
 
+        # Boundary proximity warning — smooth gradient before OOB death
+        if self.boundary_warning_distance > 0 and self.boundary_penalty_scale > 0:
+            for coord in [pos[0], pos[1]]:
+                dist_to_lo = coord - self.boundary_min
+                dist_to_hi = self.boundary_max - coord
+                closest_edge = min(dist_to_lo, dist_to_hi)
+                if closest_edge < self.boundary_warning_distance:
+                    frac = 1.0 - closest_edge / self.boundary_warning_distance
+                    reward -= frac * self.boundary_penalty_scale
+
         # Hovering penalty
         if speed < 0.1:
             reward -= self.hovering_penalty
@@ -445,21 +472,6 @@ class DroneAvoidanceEnv(gym.Env):
         # Connect to CoppeliaSim on first call
         self._connect()
 
-        # Stop any running simulation
-        try:
-            self.sim.stopSimulation()
-            while self.sim.getSimulationState() != self.sim.simulation_stopped:
-                time.sleep(0.1)
-        except Exception:
-            pass
-
-        # Apply sim settings before starting
-        self._apply_sim_settings()
-
-        # Start a fresh simulation
-        self.sim.startSimulation()
-        time.sleep(0.5)
-
         # Reset episode state
         self.step_count = 0
         self.visited_cells = set()
@@ -467,35 +479,56 @@ class DroneAvoidanceEnv(gym.Env):
         self.last_cell = None
         self.prev_action = np.zeros(3, dtype=np.float32)
 
-        # Place drone and target at the starting position
         if self.randomize_start_pose:
-            lo = self.boundary_min + self.spawn_margin
-            hi = self.boundary_max - self.spawn_margin
             z = self.flight_height
-            safe_threshold = max(self.collision_distance * 3, 0.3)
 
-            # Rejection sampling: keep trying until we find a spawn that
-            # isn't inside or right next to an obstacle.
-            for attempt in range(20):
+            # Load spawn map on first use (if provided)
+            if self._safe_spawns is None and self.spawn_map_path:
+                try:
+                    self._safe_spawns = np.load(self.spawn_map_path)
+                    print(f"  Loaded {len(self._safe_spawns)} safe spawn positions "
+                          f"from {self.spawn_map_path}")
+                except Exception as e:
+                    print(f"  Spawn map load failed ({e}), using random sampling")
+                    self._safe_spawns = np.array([])
+
+            # Pick spawn position from safe map or random
+            if self._safe_spawns is not None and len(self._safe_spawns) > 0:
+                idx = self.np_random.integers(len(self._safe_spawns))
+                x, y = float(self._safe_spawns[idx, 0]), float(self._safe_spawns[idx, 1])
+            else:
+                lo = self.boundary_min + self.spawn_margin
+                hi = self.boundary_max - self.spawn_margin
                 x = float(self.np_random.uniform(lo, hi))
                 y = float(self.np_random.uniform(lo, hi))
-                self.sim.setObjectPosition(
-                    self.drone, self.sim.handle_world, [x, y, z]
-                )
-                set_target(self.sim, self.target, x, y, z)
-                # Step a few times so sensors + flight controller update
-                for _ in range(10):
-                    self.sim.step()
-                lidar = read_lidar_array(self.sim, self.lidar_handles)
-                if np.min(lidar) > safe_threshold:
-                    break  # Safe spawn
+
+            # Stop sim, set position while stopped (clean PID reset),
+            # start fresh.  With the spawn map this is exactly one
+            # stop/start per reset — no retries needed.
+            try:
+                self.sim.stopSimulation()
+                while self.sim.getSimulationState() != self.sim.simulation_stopped:
+                    time.sleep(0.05)
+            except Exception:
+                pass
+            self.sim.setObjectPosition(
+                self.drone, self.sim.handle_world, [x, y, z]
+            )
+            set_target(self.sim, self.target, x, y, z)
+            self._apply_sim_settings()
+            self.sim.startSimulation()
         else:
+            # Fixed spawn — ensure sim is running (first call or after close)
+            if self.sim.getSimulationState() == self.sim.simulation_stopped:
+                self._apply_sim_settings()
+                self.sim.startSimulation()
             pos = get_drone_pos_array(self.sim, self.drone)
             set_target(self.sim, self.target, pos[0], pos[1], self.flight_height)
+            x, y, z = pos[0], pos[1], self.flight_height
 
         # Build first observation
         observation = self._get_observation()
-        info = {'visited_cells': 0, 'start_pos': [x, y, z] if self.randomize_start_pose else None}
+        info = {'visited_cells': 0, 'start_pos': [float(x), float(y), float(z)]}
 
         return observation, info
 
@@ -584,7 +617,7 @@ class DroneAvoidanceEnv(gym.Env):
         # Attach step diagnostics
         info['step'] = self.step_count
         info['visited_cells'] = len(self.visited_cells)
-        info['min_lidar'] = float(np.min(observation[:4]))
+        info['min_lidar'] = float(np.min(observation[:4 * self.lidar_bins]))
 
         if do_profile:
             self._profile["steps"] += 1

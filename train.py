@@ -41,7 +41,7 @@ ENV_CONFIG = dict(
     max_steps=2000,                    # Max steps before episode ends
     speed_scale=0.1,                   # Scales agent action into movement
     collision_distance=0.1,            # LiDAR distance that counts as a crash (m)
-    proximity_threshold=0.25,          # WAS 1.0 — narrowed so narrow corridors are penalty-free
+    proximity_threshold=0.4,           # WAS 0.25 — bumped for longer push-back gradient
     boundary_min=-9.0,                 # Min x/y boundary of the flying area (m)
     boundary_max=9.0,                  # Max x/y boundary of the flying area (m)
     min_altitude=0.3,                  # Lowest allowed flight height (m)
@@ -49,6 +49,7 @@ ENV_CONFIG = dict(
     flight_height=1.5,                 # Starting flight height (m)
     ideal_altitude=1.5,                # Ideal cruising altitude — rewarded for staying near (m)
     exploration_grid_size=0.5,         # Size of grid cells for exploration tracking (m)
+    lidar_bins=4,                      # Angular bins per sensor (4 bins × 4 sensors = 16 features)
 
     # ── Reward weights (Step 1 rebalance) ───────────────────────────────
     # Goal: break the "big perimeter circle" attractor by removing the
@@ -73,6 +74,8 @@ ENV_CONFIG = dict(
     altitude_linear_scale=0.3,         # WAS 1.5 — softened linear slope
     altitude_quadratic_scale=0.5,      # WAS 3.0 — softened quadratic slope
     action_smoothness_scale=0.02,      # NEW — penalty on ||a_t - a_{t-1}||^2
+    boundary_warning_distance=0.7,     # NEW — penalty ramps up within 0.7m of any edge
+    boundary_penalty_scale=2.0,        # NEW — multiplier on boundary proximity penalty
     # ────────────────────────────────────────────────────────────────────
 
     # ── Spawn randomization (Step 3) ────────────────────────────────────
@@ -80,25 +83,27 @@ ENV_CONFIG = dict(
     # (x, y) each episode. Spawn area is boundary ± margin.
     randomize_start_pose=True,         # NEW — random spawn each reset
     spawn_margin=2.0,                  # Inset from boundaries (m), spawn in [-7, 7]
+    spawn_map_path="spawn_map.npy",   # Pre-computed safe spawns (None = rejection sampling)
     # ────────────────────────────────────────────────────────────────────
 
     disable_visualization=True,        # Toggle visualization off on reset
-    lidar_resolution=32,               # Vision sensor resolution (square)
+    lidar_resolution=16,               # Vision sensor resolution (square)
 )
 
 
 #  PPO parameters
 PPO_CONFIG = dict(
-    learning_rate=5e-4,                # Learning rate (alpha)
-    n_steps=256,                      # Steps per rollout before policy update
+    learning_rate=3e-4,                # WAS 5e-4 — lowered to fix high approx_kl with VecNormalize
+    n_steps=256,                      # Steps per rollout before policy update (× NUM_ENVS = total)
     batch_size=64,                     # Minibatch size for each gradient step
     n_epochs=10,                       # Number of PPO update epochs per rollout
-    gamma=0.98,                        # Discount factor for future rewards
+    gamma=0.995,                       # WAS 0.98 — longer planning horizon (~200 steps / 10s at 50ms dt)
     gae_lambda=0.95,                   # GAE lambda for advantage estimation
     clip_range=0.2,                    # PPO clipping range for policy updates
     ent_coef=0.01,                     # Entropy coefficient (encourages exploration)
     vf_coef=0.5,                       # Value function loss weight
     max_grad_norm=0.5,                 # Max gradient norm for clipping
+    target_kl=0.025,                   # Stop update early if approx_kl exceeds this
 )
 
 #  Evaluation Config
