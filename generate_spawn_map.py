@@ -26,10 +26,10 @@ from lidar import get_lidar_handles, read_lidar_array
 HOST = "localhost"
 PORT = 23000
 GRID_STEP = 0.5          # metres between sweep positions
-BOUNDARY_MIN = -9.0
-BOUNDARY_MAX = 9.0
+BOUNDARY_MIN = -8.0      # Inset from the actual flight bounds (+/-9) so
+BOUNDARY_MAX = 8.0       # spawns never land in the boundary warning zone
 FLIGHT_HEIGHT = 1.5
-SAFE_THRESHOLD = 0.4     # min_lidar above this = safe to spawn
+SAFE_THRESHOLD = 0.25    # min_lidar above this = safe to spawn
 OUTPUT_FILE = "spawn_map.npy"
 PREVIEW_FILE = "spawn_map_preview.txt"
 

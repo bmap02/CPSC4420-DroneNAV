@@ -27,7 +27,19 @@ The scene (`CoppeliaSim Drone Follower.ttt`) must contain:
 - `/Quadcopter/base/lidarRight/body/sensor` — right LiDAR vision sensor
 - Static obstacles (trees, buildings, etc.) and dynamic obstacles (animated people on paths)
 
+Each LiDAR sensor's FOV must be set to **90 degrees** in the Lua script under each `lidarX` object (`sysCall_init`, `scanningAngle` variable). This gives full 360-degree coverage with no diagonal blind spots.
+
 ## Usage
+
+### Generating the spawn map (one-time)
+
+Before training with randomized start poses, generate the safe-spawn map:
+
+```bash
+python generate_spawn_map.py
+```
+
+This sweeps the drone (frozen, flight script disabled) across the entire map at 0.5 m intervals, reads lidar at each position, and saves all obstacle-free positions to `spawn_map.npy`. Also creates `spawn_map_preview.txt` with a human-readable grid.
 
 ### Training
 
@@ -61,20 +73,20 @@ python train.py --resume --model models/checkpoints/drone_ppo_10000_steps
 
 ```bash
 cd ~/rl_testing/CPSC4420-DroneNAV
-apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && python3 train.py --final-name drone_ppo_palmetto_v9"
+apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && python3 train.py --final-name drone_ppo_palmetto_v14"
 ```
 
 ## How it works
 
-### Observation (10D, flat Box, unnormalized)
+### Observation (22D, normalized by VecNormalize)
 
 | Index | Field | Units |
 |---|---|---|
-| `[0:4]` | 4 LiDAR min-distances (Front, Back, Left, Right) | m |
-| `[4:7]` | Drone world position (x, y, z) | m |
-| `[7:10]` | Drone linear velocity (vx, vy, vz) | m/s |
+| `[0:16]` | 16 LiDAR angular bins (4 bins × 4 sensors: F, B, L, R) | m |
+| `[16:19]` | Drone world position (x, y, z) | m |
+| `[19:22]` | Drone linear velocity (vx, vy, vz) | m/s |
 
-Each "LiDAR" is a 32×32 depth image from a CoppeliaSim vision sensor, reduced to its minimum valid depth (readings below `0.01 m` are filtered out, max range is `5.0 m`).
+Each sensor's 16×16 depth buffer (90-degree FOV) is split into 4 column bins, giving angular resolution of ~22.5 degrees per bin. The minimum valid depth in each bin is reported (readings below `0.01 m` are filtered out, max range is `5.0 m`). VecNormalize wraps the environment to normalize observations and rewards to zero-mean, unit-variance.
 
 ### Action (3D, continuous)
 
@@ -90,7 +102,8 @@ Every reward weight is configurable from `train.py`'s `ENV_CONFIG` — `drone_en
 | `exploration_reward` | one-shot `+` | Bonus the first time the drone enters each 0.5 m grid cell |
 | `movement_reward` | per-step `+` | Reward when horizontal speed `> 0.1 m/s` (currently `0`) |
 | `altitude_bonus` | per-step `+` | Reward when within the altitude soft band |
-| `proximity_penalty` | per-step `−` | Quadratic or linear in `(proximity_threshold − min_lidar)` |
+| `proximity_penalty` | per-step `−` | Quadratic in `(proximity_threshold − min_lidar)` |
+| `boundary_penalty` | per-step `−` | Linear ramp within `boundary_warning_distance` of map edges |
 | `stagnation_penalty` | per-step `−` | Accrues after camping in one cell for too long |
 | `altitude_penalty` | per-step `−` | Linear then quadratic outside the soft band |
 | `hovering_penalty` | per-step `−` | Penalty when horizontal speed `< 0.1 m/s` (currently `0`) |
@@ -107,7 +120,7 @@ The reward has been deliberately rebalanced (see *Reward design notes* below) to
 
 ### Training loop
 
-`train.py` uses stable-baselines3 PPO with a `[256, 256]` ReLU MLP and 16 `SubprocVecEnv` workers, each talking to its own CoppeliaSim instance over ZMQ. Default total budget is 500 k timesteps. Checkpoints are written every 10 k steps, and a "latest" model every 5 k steps so in-progress training is always recoverable.
+`train.py` uses stable-baselines3 PPO with a `[256, 256]` ReLU MLP and 16 `SubprocVecEnv` workers, each talking to its own CoppeliaSim instance over ZMQ. The vec env is wrapped in `VecNormalize` (obs + reward normalization) — stats are saved to `stats/{run_name}_vecnormalize.pkl` alongside the model. Default total budget is 500 k timesteps. Checkpoints are written every 10 k steps, and a "latest" model every 5 k steps so in-progress training is always recoverable. Start poses are randomized each episode using a pre-computed spawn map (`spawn_map.npy`).
 
 ## Reward design notes
 
@@ -127,7 +140,7 @@ Total episode reward: `~+17,560`. The policy was not "exploring" — it was runn
 | Term | Old | New | Why |
 |---|---|---|---|
 | `movement_reward` | `4.0` | `0.0` | Laps 2+ now pay nothing. The big circle is no longer profitable after the first lap. |
-| `proximity_threshold` | `1.0 m` | `0.25 m` | Narrow corridors with walls at ≥ 0.25 m are penalty-free. The drone can thread gaps instead of avoiding the interior. |
+| `proximity_threshold` | `1.0 m` | `0.4 m` | Narrowed so corridors ≥ 0.8 m wide are penalty-free, but still gives a push-back gradient starting 0.4 m from obstacles. |
 | `proximity_penalty_scale` | `3.5` (linear) | `25.0` (quadratic) | With the threshold tightened, the penalty scale was raised and the shape changed to `((threshold − d)/threshold)²` so near-collision is sharply punished. |
 | `hovering_penalty` | `1.0` | `0.0` | Removed alongside the movement bonus. Keeping it created a one-sided cliff at `speed = 0.1` with nothing on the other side — just noise for the value function to learn. |
 | `altitude_soft_band` | `0.3 m` | `0.5 m` | Widened so the drone has room to change altitude without penalty. |
@@ -137,22 +150,20 @@ Total episode reward: `~+17,560`. The policy was not "exploring" — it was runn
 
 ### Near-collision penalty profile
 
-With `proximity_threshold = 0.25 m`, `scale = 25`, quadratic, the per-step reward near obstacles looks like this (with the `+0.8/step` base from survival + altitude):
+With `proximity_threshold = 0.4 m`, `scale = 25`, quadratic, the per-step reward near obstacles looks like this (with the `+0.8/step` base from survival + altitude):
 
 | Lidar distance | Net reward/step | Interpretation |
 |---|---|---|
-| `≥ 0.25 m` | `+0.8` | Free zone — any corridor `≥ 0.5 m` wide is penalty-free |
-| `0.22 m` | `+0.44` | Mild warning |
-| `0.20 m` | `−0.20` | Mild warning |
-| `0.15 m` | `−3.20` | Danger zone |
-| `0.12 m` | `−5.96` | Imminent collision |
+| `≥ 0.40 m` | `+0.8` | Free zone — any corridor `≥ 0.8 m` wide is penalty-free |
+| `0.35 m` | `+0.6` | Mild warning |
+| `0.30 m` | `−0.75` | Moderate |
+| `0.25 m` | `−3.0` | Danger zone |
+| `0.15 m` | `−9.0` | Imminent collision |
 | `< 0.10 m` | `−60` + terminal | Collision, episode ends |
 
 ### What this change does and doesn't fix
 
 **Does fix:** the reward landscape no longer pays for circling, oscillation, or ramming walls. Interior sweep is worth ~50 % more than the big perimeter circle. Near-collision is unambiguously negative for the first time.
-
-**Does not fix:** the *policy-space* attractor. With a fixed start pose, all rollouts begin at the same point, and PPO's initial exploration strategy (the big perimeter circle) is a strong local optimum that's hard to escape even when it's no longer globally optimal. Breaking that attractor requires *randomizing the spawn pose within the map* so PPO sees rollouts that start in the interior — planned as a future change.
 
 **Observability gap (unchanged):** dynamic pedestrians move, but the observation has no memory. The policy sees only the instantaneous distance to each obstacle, so it cannot form a velocity estimate and cannot predict where a pedestrian will be next step. This limits "predictive" avoidance to reflexive distance-based avoidance until the observation adds temporal context (frame stacking or a recurrent policy).
 
@@ -162,8 +173,11 @@ With `proximity_threshold = 0.25 m`, `scale = 25`, quadratic, the per-step rewar
 |---|---|
 | `train.py` | PPO training / testing entry point. All tunable config (`ENV_CONFIG`, `PPO_CONFIG`, `EVAL_CONFIG`, launcher paths) lives at the top of the file. |
 | `drone_environment.py` | Gymnasium environment wrapping CoppeliaSim. All reward and env kwargs are required keyword-only — supplied by `train.py`. |
-| `lidar.py` | Reads and formats depth data from the 4 vision-based LiDAR sensors. |
-| `navigation.py` | Position / velocity getters, distance helper, and target-dummy mover. |
+| `lidar.py` | Reads depth data from 4 vision sensors with angular binning support. |
+| `navigation.py` | Position / velocity getters and target-dummy mover. |
+| `generate_spawn_map.py` | One-time script to sweep the map and generate `spawn_map.npy`. |
+| `spawn_map.npy` | Pre-computed Nx2 array of safe (x, y) spawn positions. |
+| `spawn_map_preview.txt` | Human-readable grid showing safe (.) and obstacle (X) positions. |
 | `CoppeliaSim Drone Follower.ttt` | The training scene. |
 
 ## Configuration
@@ -175,14 +189,18 @@ With `proximity_threshold = 0.25 m`, `scale = 25`, quadratic, the per-step rewar
 | `max_steps` | `2000` | Max steps per episode before truncation |
 | `speed_scale` | `0.1` | Multiplier applied to policy action before it's sent to the target dummy |
 | `collision_distance` | `0.1` | LiDAR distance (m) that triggers collision termination |
-| `proximity_threshold` | `0.25` | LiDAR distance (m) below which the proximity penalty applies |
+| `proximity_threshold` | `0.4` | LiDAR distance (m) below which the proximity penalty applies |
 | `boundary_min` / `boundary_max` | `-9.0` / `9.0` | Flight volume x/y bounds (m) |
 | `min_altitude` / `max_altitude` | `0.3` / `3.0` | Allowed altitude range (m) |
 | `flight_height` | `1.5` | Starting altitude on reset (m) |
 | `ideal_altitude` | `1.5` | Ideal cruising altitude (m) |
 | `exploration_grid_size` | `0.5` | Grid cell size for exploration tracking (m) |
+| `lidar_bins` | `4` | Angular bins per sensor (4 bins × 4 sensors = 16 features) |
+| `randomize_start_pose` | `True` | Random spawn from spawn map each reset |
+| `spawn_margin` | `2.0` | Inset from boundaries for fallback random sampling (m) |
+| `spawn_map_path` | `spawn_map.npy` | Pre-computed safe spawn positions |
 | `disable_visualization` | `True` | Disable sim display on reset (required for headless training) |
-| `lidar_resolution` | `32` | Vision sensor resolution (square) |
+| `lidar_resolution` | `16` | Vision sensor resolution (square) |
 
 ### Reward weights (`ENV_CONFIG` in `train.py`)
 
@@ -205,21 +223,24 @@ With `proximity_threshold = 0.25 m`, `scale = 25`, quadratic, the per-step rewar
 | `altitude_linear_scale` | `0.3` | Linear penalty slope inside the linear band |
 | `altitude_quadratic_scale` | `0.5` | Quadratic penalty slope outside the linear band |
 | `action_smoothness_scale` | `0.02` | Penalty on `‖a_t − a_{t-1}‖²` |
+| `boundary_warning_distance` | `0.7` | Distance from edge where boundary penalty starts (m) |
+| `boundary_penalty_scale` | `2.0` | Multiplier on boundary proximity penalty |
 
 ### PPO hyperparameters (`PPO_CONFIG` in `train.py`)
 
 | Parameter | Value | Description |
 |---|---|---|
-| `learning_rate` | `5e-4` | Learning rate (Adam) |
+| `learning_rate` | `3e-4` | Learning rate (Adam) |
 | `n_steps` | `256` | Steps per env per rollout (× 16 envs = 4096-sample rollouts) |
 | `batch_size` | `64` | Minibatch size for each gradient step |
 | `n_epochs` | `10` | PPO update epochs per rollout |
-| `gamma` | `0.98` | Discount factor |
+| `gamma` | `0.995` | Discount factor (~200 step / 10 s planning horizon) |
 | `gae_lambda` | `0.95` | GAE lambda for advantage estimation |
 | `clip_range` | `0.2` | PPO clipping range |
 | `ent_coef` | `0.01` | Entropy coefficient |
 | `vf_coef` | `0.5` | Value function loss weight |
 | `max_grad_norm` | `0.5` | Gradient clipping threshold |
+| `target_kl` | `0.025` | Stop update early if approx_kl exceeds this |
 
 ### Training budget (`train.py` constants)
 
@@ -235,10 +256,6 @@ With `proximity_threshold = 0.25 m`, `scale = 25`, quadratic, the per-step rewar
 
 ## Known limitations
 
-These are tracked in `.claude/plans/dazzling-questing-boole.md` (project-internal critique) and will be addressed in subsequent changes:
-
-- **Fixed spawn pose.** All rollouts start at the same point. Even with the reward rebalance, the big-circle attractor is still a strong local optimum in policy space. Fix: randomize start pose within the map on each `reset()`.
 - **No temporal observation.** The policy has no memory, so it cannot predict pedestrian motion — only react to it. Fix: `VecFrameStack(k=4)` or switch to `RecurrentPPO`.
-- **No `VecNormalize`.** Observations are unbounded and rewards are large-magnitude. PPO's value function is harder to fit than it needs to be. Fix: wrap the vec env with `VecNormalize(norm_obs=True, norm_reward=True)` and persist the stats alongside the model.
-- **Eval is disabled.** `EVAL_CONFIG["enabled"] = False`. There's no objective generalization metric in TensorBoard. Fix: enable the eval callback (and fix the port-collision bug at `train.py:359` while you're in there).
-- **Lossy LiDAR.** Each 32×32 depth image is reduced to its minimum, throwing away all bearing information within the sensor's wedge. Fix: angular-binned lidar feature (e.g. 8 bins × 4 sensors = 32 features) with optional small encoder.
+- **Eval is disabled.** `EVAL_CONFIG["enabled"] = False`. There's no objective generalization metric in TensorBoard separate from training noise. Fix: enable the eval callback and wire up a dedicated eval env.
+- **LiDAR angular resolution.** Angular binning (4 bins per sensor) partially addresses bearing information, but finer resolution (8+ bins) or a learned encoder could improve obstacle localization further.

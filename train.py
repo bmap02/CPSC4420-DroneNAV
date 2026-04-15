@@ -44,8 +44,8 @@ ENV_CONFIG = dict(
     proximity_threshold=0.4,           # WAS 0.25 — bumped for longer push-back gradient
     boundary_min=-9.0,                 # Min x/y boundary of the flying area (m)
     boundary_max=9.0,                  # Max x/y boundary of the flying area (m)
-    min_altitude=0.3,                  # Lowest allowed flight height (m)
-    max_altitude=3.0,                  # Highest allowed flight height (m)
+    min_altitude=0.5,                  # Lowest allowed flight height (m)
+    max_altitude=2.5,                  # Highest allowed flight height (m)
     flight_height=1.5,                 # Starting flight height (m)
     ideal_altitude=1.5,                # Ideal cruising altitude — rewarded for staying near (m)
     exploration_grid_size=0.5,         # Size of grid cells for exploration tracking (m)
@@ -71,8 +71,8 @@ ENV_CONFIG = dict(
     altitude_bonus=0.5,                # Bonus inside the altitude soft band
     altitude_soft_band=0.5,            # WAS 0.3 — widened so altitude isn't the main gradient
     altitude_linear_band=1.0,          # Linear-region half-width (m)
-    altitude_linear_scale=0.3,         # WAS 1.5 — softened linear slope
-    altitude_quadratic_scale=0.5,      # WAS 3.0 — softened quadratic slope
+    altitude_linear_scale=1.0,         # WAS 0.3 — bumped for clearer gradient against going high
+    altitude_quadratic_scale=2.0,      # WAS 0.5 — sharpened for steeper penalty near altitude limits
     action_smoothness_scale=0.02,      # NEW — penalty on ||a_t - a_{t-1}||^2
     boundary_warning_distance=0.7,     # NEW — penalty ramps up within 0.7m of any edge
     boundary_penalty_scale=2.0,        # NEW — multiplier on boundary proximity penalty
@@ -96,14 +96,14 @@ PPO_CONFIG = dict(
     learning_rate=3e-4,                # WAS 5e-4 — lowered to fix high approx_kl with VecNormalize
     n_steps=256,                      # Steps per rollout before policy update (× NUM_ENVS = total)
     batch_size=64,                     # Minibatch size for each gradient step
-    n_epochs=10,                       # Number of PPO update epochs per rollout
+    n_epochs=5,                        # WAS 10 — fewer epochs = less cumulative KL drift per update
     gamma=0.995,                       # WAS 0.98 — longer planning horizon (~200 steps / 10s at 50ms dt)
     gae_lambda=0.95,                   # GAE lambda for advantage estimation
     clip_range=0.2,                    # PPO clipping range for policy updates
-    ent_coef=0.01,                     # Entropy coefficient (encourages exploration)
+    ent_coef=0.005,                    # WAS 0.01 — lowered so policy can commit (std kept rising in v10/v11)
     vf_coef=0.5,                       # Value function loss weight
     max_grad_norm=0.5,                 # Max gradient norm for clipping
-    target_kl=0.025,                   # Stop update early if approx_kl exceeds this
+    target_kl=0.04,                    # WAS 0.03 — raised to give more headroom (effective cutoff = 1.5x = 0.06)
 )
 
 #  Evaluation Config
