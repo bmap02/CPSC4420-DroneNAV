@@ -1,0 +1,8 @@
+coppeliasim-zmqremoteapi-client
+gymnasium
+numpy
+stable-baselines3
+tensorboard
+torch
+rich
+tqdm

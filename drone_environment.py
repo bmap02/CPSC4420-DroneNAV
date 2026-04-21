@@ -15,22 +15,22 @@ Observation (10D):
     [7:10] — drone velocity (vx, vy, vz)
 
 Action (3D):
-    Velocity adjustments (dx, dy, dz) in [-1, 1]
-    Applied on top of baseline safety rules
+    Velocity adjustments (dx, dy, dz) in [-1, 1], clipped and scaled
+    by speed_scale before being sent to the target dummy. No hand-coded
+    nudging — the policy is the sole source of control.
 
-Reward:
-    +1.0  per step survived
-    +5.0  for visiting a new grid cell
-    +0.5  movement bonus (speed above 0.1 m/s)
-    -var  proximity penalty (scales with closeness to obstacles)
-    -var  stagnation penalty (camping in one cell)
-    -var  altitude penalty (scales with distance from ideal)
-    -0.3  hovering penalty (speed below 0.05 m/s)
-    -50   collision (episode terminates)
-    -50   out of bounds (episode terminates)
-
-Baseline safety rules:
-    - Light horizontal repulsion when obstacles are detected
+Reward (all weights configurable via __init__ kwargs / train.py ENV_CONFIG):
+    + survival_reward          per step survived
+    + exploration_reward       one-shot bonus for visiting a new grid cell
+    + movement_reward          when horizontal speed > 0.1 m/s
+    + altitude_bonus           when inside the altitude soft band
+    - proximity penalty        linear or quadratic in (proximity_threshold - min_lidar)
+    - stagnation penalty       after camping in one cell too long
+    - altitude penalty         linear then quadratic outside the soft band
+    - hovering penalty         when horizontal speed < 0.1 m/s
+    - action smoothness        scale * ||a_t - a_{t-1}||^2 (0 disables)
+    - collision_penalty        terminal, episode ends
+    - out_of_bounds_penalty    terminal, episode ends
 """
 
 import time
@@ -40,7 +40,7 @@ from gymnasium import spaces
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
-from lidar import get_lidar_handles, read_lidar_array
+from lidar import get_lidar_handles, read_lidar_array, set_lidar_resolution
 from navigation import get_drone_pos_array, get_drone_velocity, set_target
 
 
@@ -53,27 +53,61 @@ class DroneAvoidanceEnv(gym.Env):
 
     The agent controls the drone's velocity in 3D space. Altitude
     is clamped and penalized to discourage cheating by flying above
-    obstacles. Baseline repulsion provides a light horizontal nudge.
+    obstacles.
     """
 
     metadata = {"render_modes": ["human"], "render_fps": 20}
 
     def __init__(
         self,
-        max_steps=2000,                    # Max steps before episode ends
-        speed_scale=0.05,                  # Scales agent action into movement
-        collision_distance=0.3,            # LiDAR distance that counts as a crash (m)
-        proximity_threshold=1.0,           # Distance to start avoiding obstacles (m)
-        altitude_boost_threshold=0.5,      # Distance to start gaining altitude (m)
-        boundary_min=-5.0,                 # Min x/y boundary of the flying area (m)
-        boundary_max=5.0,                  # Max x/y boundary of the flying area (m)
-        min_altitude=0.3,                  # Lowest allowed flight height (m)
-        max_altitude=4.0,                  # Highest allowed flight height (m)
-        flight_height=1.5,                 # Starting flight height (m)
-        ideal_altitude=1.5,                # Ideal cruising altitude (m) — reward for staying near
-        altitude_boost_cap=2.5,            # Max altitude the baseline boost can push to (m)
-        exploration_grid_size=0.5,         # Size of grid cells for exploration tracking (m)
+        *,
+        # ── Episode / control (required — supplied by train.py ENV_CONFIG) ──
+        max_steps,                         # Max steps before episode ends
+        speed_scale,                       # Scales agent action into movement
+        collision_distance,                # LiDAR distance that counts as a crash (m)
+        proximity_threshold,               # Distance below which proximity penalty applies (m)
+        boundary_min,                      # Min x/y boundary of the flying area (m)
+        boundary_max,                      # Max x/y boundary of the flying area (m)
+        min_altitude,                      # Lowest allowed flight height (m)
+        max_altitude,                      # Highest allowed flight height (m)
+        flight_height,                     # Starting flight height (m)
+        ideal_altitude,                    # Ideal cruising altitude (m) — reward for staying near
+        exploration_grid_size,             # Size of grid cells for exploration tracking (m)
+        lidar_bins,                        # Angular bins per sensor (1 = legacy, 4 = 16 features)
+        # ── Reward weights (required — single source of truth is train.py) ──
+        survival_reward,                   # Per-step bonus for staying alive
+        exploration_reward,                # One-shot bonus for visiting a new grid cell
+        movement_reward,                   # Per-step bonus when horizontal speed > 0.1 m/s
+        stagnation_start,                  # Steps in one cell before stagnation kicks in
+        stagnation_rate,                   # Per-step penalty accrual while stagnating
+        stagnation_cap,                    # Max stagnation penalty per step
+        proximity_penalty_scale,           # Multiplier on the proximity penalty
+        proximity_penalty_quadratic,       # If True, use ((1-d/T)^2) * scale; else linear
+        collision_penalty,                 # Terminal penalty for hitting an obstacle
+        out_of_bounds_penalty,             # Terminal penalty for leaving the flight volume
+        hovering_penalty,                  # Per-step penalty when speed < 0.1 m/s
+        altitude_bonus,                    # Bonus when within altitude_soft_band of ideal
+        altitude_soft_band,                # Half-width of the "free altitude" band (m)
+        altitude_linear_band,              # Beyond this Δ, switch to quadratic penalty (m)
+        altitude_linear_scale,             # Linear penalty multiplier inside linear band
+        altitude_quadratic_scale,          # Quadratic penalty multiplier outside linear band
+        action_smoothness_scale,           # Penalty on ||a_t - a_{t-1}||^2 (0 = disabled)
+        boundary_warning_distance,         # Distance from edge where boundary penalty starts (m)
+        boundary_penalty_scale,            # Multiplier on boundary proximity penalty
+        # ── Spawn randomization ──
+        randomize_start_pose,              # If True, sample (x, y) each reset
+        spawn_margin,                      # Inset from boundary_min/max for spawn area (m)
+        spawn_map_path,                    # Path to spawn_map.npy (None = rejection sampling)
+        # ── Sim / IO (required — supplied by train.py) ──
+        disable_visualization,             # Toggle visualization off on reset
+        lidar_resolution,                  # Vision sensor resolution (square). None to skip
+        headless,                          # Skip display toggles when running headless
+        host,                              # Remote API host
+        port,                              # Remote API port (unique per sim instance)
+        # ── Debug / optional (have defaults because train.py doesn't pass them) ──
         render_mode=None,                  # Gymnasium render mode
+        profile_every=0,                   # Print timing stats every N steps (0 disables)
+        cntport=None,                      # Remote API control port (optional)
     ):
         """
         Initializes the drone environment.
@@ -88,10 +122,8 @@ class DroneAvoidanceEnv(gym.Env):
             speed_scale (float): Multiplier applied to actions.
             collision_distance (float): LiDAR reading below this
                 triggers a crash and ends the episode.
-            proximity_threshold (float): LiDAR reading below this
-                activates baseline safety rules.
-            altitude_boost_threshold (float): LiDAR reading below
-                this triggers an altitude increase.
+            proximity_threshold (float): LiDAR reading below which the
+                proximity penalty starts accruing.
             boundary_min (float): Min x/y world coordinate.
             boundary_max (float): Max x/y world coordinate.
             min_altitude (float): Minimum allowed z position.
@@ -100,8 +132,6 @@ class DroneAvoidanceEnv(gym.Env):
             ideal_altitude (float): Ideal cruising altitude. The
                 agent is rewarded for staying near this height
                 and penalized for drifting away.
-            altitude_boost_cap (float): Maximum altitude the
-                baseline altitude boost rule can push to.
             exploration_grid_size (float): Grid cell size for
                 tracking which areas the drone has visited.
             render_mode (str, optional): Gymnasium render mode.
@@ -113,21 +143,59 @@ class DroneAvoidanceEnv(gym.Env):
         self.speed_scale = speed_scale
         self.collision_distance = collision_distance
         self.proximity_threshold = proximity_threshold
-        self.altitude_boost_threshold = altitude_boost_threshold
         self.boundary_min = boundary_min
         self.boundary_max = boundary_max
         self.min_altitude = min_altitude
         self.max_altitude = max_altitude
         self.flight_height = flight_height
         self.ideal_altitude = ideal_altitude
-        self.altitude_boost_cap = altitude_boost_cap
         self.exploration_grid_size = exploration_grid_size
+        self.lidar_bins = lidar_bins
+
+        # Reward weights
+        self.survival_reward = survival_reward
+        self.exploration_reward = exploration_reward
+        self.movement_reward = movement_reward
+        self.stagnation_start = stagnation_start
+        self.stagnation_rate = stagnation_rate
+        self.stagnation_cap = stagnation_cap
+        self.proximity_penalty_scale = proximity_penalty_scale
+        self.proximity_penalty_quadratic = proximity_penalty_quadratic
+        self.collision_penalty = collision_penalty
+        self.out_of_bounds_penalty = out_of_bounds_penalty
+        self.hovering_penalty = hovering_penalty
+        self.altitude_bonus = altitude_bonus
+        self.altitude_soft_band = altitude_soft_band
+        self.altitude_linear_band = altitude_linear_band
+        self.altitude_linear_scale = altitude_linear_scale
+        self.altitude_quadratic_scale = altitude_quadratic_scale
+        self.action_smoothness_scale = action_smoothness_scale
+        self.boundary_warning_distance = boundary_warning_distance
+        self.boundary_penalty_scale = boundary_penalty_scale
+
+        # Spawn randomization
+        self.randomize_start_pose = randomize_start_pose
+        self.spawn_margin = spawn_margin
+        self.spawn_map_path = spawn_map_path
+        self._safe_spawns = None  # loaded lazily on first reset
+
+        # Sim / IO
         self.render_mode = render_mode
+        self.profile_every = profile_every
+        self.disable_visualization = disable_visualization
+        self.lidar_resolution = lidar_resolution
+        self.headless = headless
+        self.host = host
+        self.port = port
+        self.cntport = cntport
 
         # Observation space
-        # 4 lidar readings + 3 position + 3 velocity = 10
+        # (4 sensors × lidar_bins) lidar + 3 position + 3 velocity
+        # Cached as self.lidar_dim / self.obs_dim for use in hot paths
+        self.lidar_dim = 4 * self.lidar_bins
+        self.obs_dim = self.lidar_dim + 3 + 3
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
         )
 
         # Action space
@@ -141,6 +209,7 @@ class DroneAvoidanceEnv(gym.Env):
         self.sim = None
         self.drone = None
         self.target = None
+        self.flight_script = None
         self.lidar_handles = {}
 
         # ── Episode state ──
@@ -148,7 +217,21 @@ class DroneAvoidanceEnv(gym.Env):
         self.visited_cells = set()
         self.steps_in_current_cell = 0
         self.last_cell = None
+        self.prev_action = np.zeros(3, dtype=np.float32)
+        # Cached target position — updated in reset() and step() so we
+        # don't have to read it from the sim every step (saves 1 ZMQ call).
+        self._target_pos = np.zeros(3, dtype=np.float32)
         self._connected = False
+
+        # Profiling accumulators (seconds)
+        self._profile = {
+            "steps": 0,
+            "target_move": 0.0,
+            "sim_step": 0.0,
+            "observation": 0.0,
+            "reward": 0.0,
+            "total": 0.0,
+        }
 
     #  Connection
     def _connect(self):
@@ -161,14 +244,30 @@ class DroneAvoidanceEnv(gym.Env):
         if self._connected:
             return
 
-        self.client = RemoteAPIClient()
+        self.client = RemoteAPIClient(host=self.host, port=self.port, cntport=self.cntport)
         self.sim = self.client.require('sim')
 
         self.drone = self.sim.getObject('/Quadcopter')
         self.target = self.sim.getObject('/target')
+        self.flight_script = self.sim.getScript(
+            self.sim.scripttype_childscript, self.drone, ''
+        )
         self.lidar_handles = get_lidar_handles(self.sim)
 
         self._connected = True
+
+    def _apply_sim_settings(self):
+        """
+        Applies sim settings that tend to reset on simulation start.
+        """
+        if self.disable_visualization and not self.headless:
+            try:
+                self.sim.setBoolParam(self.sim.boolparam_display_enabled, False)
+            except Exception as e:
+                print(f"  Visualization toggle failed: {e}")
+
+        if self.lidar_resolution:
+            set_lidar_resolution(self.sim, self.lidar_handles, self.lidar_resolution)
 
     #  Observation
     def _get_observation(self):
@@ -180,12 +279,13 @@ class DroneAvoidanceEnv(gym.Env):
         single flat array.
 
         Returns:
-            np.ndarray: Shape (10,) float32 observation.
-                [0:4]  — LiDAR distances (F, B, L, R) in metres
-                [4:7]  — Drone position (x, y, z) in metres
-                [7:10] — Drone velocity (vx, vy, vz) in m/s
+            np.ndarray: Shape (4*lidar_bins + 6,) float32 observation.
+                [0 : 4*lidar_bins]  — LiDAR angular bin distances (metres)
+                [... : ...+3]       — Drone position (x, y, z) in metres
+                [...+3 : ...+6]     — Drone velocity (vx, vy, vz) in m/s
         """
-        lidar = read_lidar_array(self.sim, self.lidar_handles)
+        lidar = read_lidar_array(self.sim, self.lidar_handles,
+                                 num_bins=self.lidar_bins)
         pos = get_drone_pos_array(self.sim, self.drone)
         vel = get_drone_velocity(self.sim, self.drone)
 
@@ -195,83 +295,48 @@ class DroneAvoidanceEnv(gym.Env):
     #  Exploration tracking
     def _get_grid_cell(self, pos):
         """
-        Converts a world position to a discrete grid cell.
+        Converts a world position to a discrete 2D grid cell (x, y only).
 
-        Used to track which areas the drone has visited so the
-        exploration reward can encourage covering new ground.
+        Height is deliberately excluded so the drone can't game the
+        exploration reward by climbing to "new" altitude slices above
+        already-explored ground.  The altitude bonus/penalty handles
+        vertical behaviour separately.
 
         Args:
             pos (np.ndarray): ``[x, y, z]`` position in metres.
 
         Returns:
-            tuple[int, int, int]: Grid cell indices (gx, gy, gz).
+            tuple[int, int]: Grid cell indices (gx, gy).
         """
         gx = int(pos[0] / self.exploration_grid_size)
         gy = int(pos[1] / self.exploration_grid_size)
-        gz = int(pos[2] / self.exploration_grid_size)
-        return (gx, gy, gz)
-
-
-    #  Baseline safety rules
-    def _apply_baseline_rules(self, action, lidar):
-        """
-        Applies a light repulsion nudge when obstacles are close.
-
-        The agent's action is the primary control — this just
-        adds a gentle push away from detected obstacles to help
-        early training. No speed reduction or altitude changes.
-
-        Args:
-            action (np.ndarray): Raw agent action, shape (3,).
-            lidar (np.ndarray): LiDAR readings [F, B, L, R].
-
-        Returns:
-            np.ndarray: Modified action with repulsion adjustment.
-        """
-        adjusted = action.copy()
-        min_lidar = np.min(lidar)
-
-        # Repulsion from obstacle direction
-        if min_lidar < self.proximity_threshold:
-            front, back, left, right = lidar
-
-            repulsion_x = 0.0
-            repulsion_y = 0.0
-
-            if front < self.proximity_threshold:
-                repulsion_x -= (self.proximity_threshold - front)
-            if back < self.proximity_threshold:
-                repulsion_x += (self.proximity_threshold - back)
-            if left < self.proximity_threshold:
-                repulsion_y += (self.proximity_threshold - left)
-            if right < self.proximity_threshold:
-                repulsion_y -= (self.proximity_threshold - right)
-
-            repulsion_scale = 0.3
-            adjusted[0] += repulsion_x * repulsion_scale
-            adjusted[1] += repulsion_y * repulsion_scale
-
-        return adjusted
+        return (gx, gy)
 
 
     #  Reward
-    def _compute_reward(self, obs):
+    def _compute_reward(self, obs, action):
         """
         Computes the reward for the current step.
 
+        All reward weights come from ``self`` attributes set in ``__init__``,
+        so they can be tuned from ``train.py`` without editing this file.
         The reward signal is a combination of:
-            +1.0  — survival bonus (awarded every step)
-            +5.0  — exploration bonus (new grid cell visited)
-            +0.5  — movement bonus (speed above 0.1 m/s)
-            -var  — proximity penalty (scales with closeness)
-            -var  — stagnation penalty (camping in one cell)
-            -var  — altitude penalty (scales with distance from ideal)
-            -0.3  — hovering penalty (speed below 0.05 m/s)
-            -50   — collision (episode terminates)
-            -50   — out of bounds (episode terminates)
+            + survival bonus (awarded every step)
+            + exploration bonus (new grid cell visited, one-shot per cell)
+            + movement bonus (speed above 0.1 m/s)
+            + altitude bonus (within soft band of ideal altitude)
+            - proximity penalty (scales with closeness to obstacles)
+            - stagnation penalty (camping in one cell)
+            - altitude penalty (linear then quadratic outside soft band)
+            - hovering penalty (speed below 0.1 m/s)
+            - action smoothness penalty (||a_t - a_{t-1}||^2)
+            - collision (episode terminates)
+            - out of bounds (episode terminates)
 
         Args:
             obs (np.ndarray): Current 10D observation vector.
+            action (np.ndarray): The (clipped) raw action the policy
+                emitted this step, used for the smoothness penalty.
 
         Returns:
             tuple[float, bool, dict]:
@@ -281,28 +346,28 @@ class DroneAvoidanceEnv(gym.Env):
                 info (dict): Additional diagnostics about what
                     triggered the reward components.
         """
-        lidar = obs[:4]
-        pos = obs[4:7]
-        vel = obs[7:10]
+        lidar = obs[:self.lidar_dim]
+        pos = obs[self.lidar_dim:self.lidar_dim + 3]
+        vel = obs[self.lidar_dim + 3:self.lidar_dim + 6]
 
         reward = 0.0
         terminated = False
         info = {}
 
         # Survival reward
-        reward += 1.0
+        reward += self.survival_reward
 
-        # Exploration reward — strong incentive to visit new areas
+        # Exploration reward — one-shot per cell
         cell = self._get_grid_cell(pos)
         if cell not in self.visited_cells:
             self.visited_cells.add(cell)
-            reward += 5.0
+            reward += self.exploration_reward
             info['new_cell'] = True
 
         # Movement bonus — reward any horizontal motion
         speed = np.linalg.norm(vel[:2])
         if speed > 0.1:
-            reward += 0.5
+            reward += self.movement_reward
 
         # Stagnation penalty — punish camping in one spot
         if cell == self.last_cell:
@@ -311,19 +376,27 @@ class DroneAvoidanceEnv(gym.Env):
             self.steps_in_current_cell = 0
             self.last_cell = cell
 
-        if self.steps_in_current_cell > 100:
-            stagnation_penalty = min((self.steps_in_current_cell - 100) * 0.05, 2.0)
+        if self.steps_in_current_cell > self.stagnation_start:
+            stagnation_penalty = min(
+                (self.steps_in_current_cell - self.stagnation_start) * self.stagnation_rate,
+                self.stagnation_cap,
+            )
             reward -= stagnation_penalty
 
-        # Obstacle proximity penalty
+        # Obstacle proximity penalty (linear or quadratic shape)
         min_lidar = np.min(lidar)
         if min_lidar < self.proximity_threshold:
-            proximity_penalty = (self.proximity_threshold - min_lidar) * 3.0
+            closeness = (self.proximity_threshold - min_lidar) / self.proximity_threshold
+            if self.proximity_penalty_quadratic:
+                proximity_penalty = (closeness ** 2) * self.proximity_penalty_scale
+            else:
+                # Legacy linear shape kept for behaviour preservation
+                proximity_penalty = (self.proximity_threshold - min_lidar) * self.proximity_penalty_scale
             reward -= proximity_penalty
 
         # Collision
         if min_lidar < self.collision_distance:
-            reward -= 50.0
+            reward -= self.collision_penalty
             terminated = True
             info['collision'] = True
 
@@ -336,23 +409,38 @@ class DroneAvoidanceEnv(gym.Env):
             or pos[2] < self.min_altitude
             or pos[2] > self.max_altitude
         ):
-            reward -= 50.0
+            reward -= self.out_of_bounds_penalty
             terminated = True
             info['out_of_bounds'] = True
 
+        # Boundary proximity warning — smooth gradient before OOB death
+        if self.boundary_warning_distance > 0 and self.boundary_penalty_scale > 0:
+            for coord in [pos[0], pos[1]]:
+                dist_to_lo = coord - self.boundary_min
+                dist_to_hi = self.boundary_max - coord
+                closest_edge = min(dist_to_lo, dist_to_hi)
+                if closest_edge < self.boundary_warning_distance:
+                    frac = 1.0 - closest_edge / self.boundary_warning_distance
+                    reward -= frac * self.boundary_penalty_scale
+
         # Hovering penalty
-        if speed < 0.05:
-            reward -= 0.3
+        if speed < 0.1:
+            reward -= self.hovering_penalty
 
         # Altitude reward/penalty — keep drone near ideal height
         altitude_diff = abs(pos[2] - self.ideal_altitude)
-        if altitude_diff < 0.3:
-            reward += 0.5
-        elif altitude_diff < 1.0:
-            reward -= altitude_diff * 1.5
+        if altitude_diff < self.altitude_soft_band:
+            reward += self.altitude_bonus
+        elif altitude_diff < self.altitude_linear_band:
+            reward -= altitude_diff * self.altitude_linear_scale
         else:
-            # Squared penalty kicks in hard above 1m deviation
-            reward -= (altitude_diff ** 2) * 3.0
+            # Squared penalty kicks in hard above the linear band
+            reward -= (altitude_diff ** 2) * self.altitude_quadratic_scale
+
+        # Action smoothness penalty — discourage twitchy control
+        if self.action_smoothness_scale > 0.0:
+            action_delta = action - self.prev_action
+            reward -= self.action_smoothness_scale * float(np.sum(action_delta ** 2))
 
         # Max steps
         if self.step_count >= self.max_steps:
@@ -388,31 +476,68 @@ class DroneAvoidanceEnv(gym.Env):
         # Connect to CoppeliaSim on first call
         self._connect()
 
-        # Stop any running simulation
-        try:
-            self.sim.stopSimulation()
-            while self.sim.getSimulationState() != self.sim.simulation_stopped:
-                time.sleep(0.1)
-        except Exception:
-            pass
-
-        # Start a fresh simulation
-        self.sim.startSimulation()
-        time.sleep(0.5)
-
         # Reset episode state
         self.step_count = 0
         self.visited_cells = set()
         self.steps_in_current_cell = 0
         self.last_cell = None
+        self.prev_action = np.zeros(3, dtype=np.float32)
 
-        # Place target at drone's position at starting height
-        pos = get_drone_pos_array(self.sim, self.drone)
-        set_target(self.sim, self.target, pos[0], pos[1], self.flight_height)
+        if self.randomize_start_pose:
+            z = self.flight_height
+
+            # Load spawn map on first use (if provided)
+            if self._safe_spawns is None and self.spawn_map_path:
+                try:
+                    self._safe_spawns = np.load(self.spawn_map_path)
+                    print(f"  Loaded {len(self._safe_spawns)} safe spawn positions "
+                          f"from {self.spawn_map_path}")
+                except Exception as e:
+                    print(f"  Spawn map load failed ({e}), using random sampling")
+                    self._safe_spawns = np.array([])
+
+            # Pick spawn position from safe map or random
+            if self._safe_spawns is not None and len(self._safe_spawns) > 0:
+                idx = self.np_random.integers(len(self._safe_spawns))
+                x, y = float(self._safe_spawns[idx, 0]), float(self._safe_spawns[idx, 1])
+            else:
+                lo = self.boundary_min + self.spawn_margin
+                hi = self.boundary_max - self.spawn_margin
+                x = float(self.np_random.uniform(lo, hi))
+                y = float(self.np_random.uniform(lo, hi))
+
+            # Stop sim, set position while stopped (clean PID reset),
+            # start fresh.  With the spawn map this is exactly one
+            # stop/start per reset — no retries needed.
+            try:
+                self.sim.stopSimulation()
+                while self.sim.getSimulationState() != self.sim.simulation_stopped:
+                    time.sleep(0.05)
+            except Exception:
+                pass
+            self.sim.setObjectPosition(
+                self.drone, self.sim.handle_world, [x, y, z]
+            )
+            set_target(self.sim, self.target, x, y, z)
+            self._apply_sim_settings()
+            self.sim.startSimulation()
+        else:
+            # Fixed spawn — ensure sim is running (first call or after close)
+            if self.sim.getSimulationState() == self.sim.simulation_stopped:
+                self._apply_sim_settings()
+                self.sim.startSimulation()
+            pos = get_drone_pos_array(self.sim, self.drone)
+            x, y, z = float(pos[0]), float(pos[1]), self.flight_height
+            set_target(self.sim, self.target, x, y, z)
+
+        # Sync cached target position
+        self._target_pos[0] = x
+        self._target_pos[1] = y
+        self._target_pos[2] = z
 
         # Build first observation
         observation = self._get_observation()
-        info = {'visited_cells': 0}
+        info = {'visited_cells': 0, 'start_pos': [float(x), float(y), float(z)]}
 
         return observation, info
 
@@ -425,11 +550,10 @@ class DroneAvoidanceEnv(gym.Env):
         Follows the Gymnasium API:
             observation, reward, terminated, truncated, info = env.step(action)
 
-        Takes the agent's raw action, applies baseline safety
-        rules on top of it, scales the result, and moves the
-        drone's target position accordingly. Then steps the
-        simulation forward and computes the new observation
-        and reward.
+        Clips the agent's action to [-1, 1], scales it by speed_scale,
+        and moves the drone's target position accordingly. Then steps
+        the simulation forward and computes the new observation and
+        reward.
 
         Args:
             action (np.ndarray): Shape (3,) array with values
@@ -449,41 +573,83 @@ class DroneAvoidanceEnv(gym.Env):
         """
         self.step_count += 1
 
-        # Clip raw action to valid range
+        do_profile = self.profile_every and self.profile_every > 0
+        if do_profile:
+            t_total_start = time.perf_counter()
+
+        # Clip raw action and scale — policy output goes straight to the sim,
+        # no hand-coded nudging.
         action = np.clip(action, -1.0, 1.0)
+        scaled_action = action * self.speed_scale
 
-        # Read current LiDAR for baseline rules
-        lidar = read_lidar_array(self.sim, self.lidar_handles)
-
-        # Apply baseline safety rules, then scale
-        adjusted_action = self._apply_baseline_rules(action, lidar)
-        scaled_action = adjusted_action * self.speed_scale
-
-        # Get current target position and apply the action
-        current_target = self.sim.getObjectPosition(
-            self.target, self.sim.handle_world
-        )
-        new_x = current_target[0] + scaled_action[0]
-        new_y = current_target[1] + scaled_action[1]
-        new_z = current_target[2] + scaled_action[2]
+        # Apply the action to the cached target position (no sim read).
+        new_x = float(self._target_pos[0] + scaled_action[0])
+        new_y = float(self._target_pos[1] + scaled_action[1])
+        new_z = float(self._target_pos[2] + scaled_action[2])
 
         # Clamp altitude to allowed range
-        new_z = max(self.min_altitude, min(self.max_altitude, new_z))
+        if new_z < self.min_altitude:
+            new_z = self.min_altitude
+        elif new_z > self.max_altitude:
+            new_z = self.max_altitude
 
+        # Write back both the cache and the sim
+        self._target_pos[0] = new_x
+        self._target_pos[1] = new_y
+        self._target_pos[2] = new_z
+
+        if do_profile:
+            t0 = time.perf_counter()
         set_target(self.sim, self.target, new_x, new_y, new_z)
+        if do_profile:
+            self._profile["target_move"] += time.perf_counter() - t0
 
         # Advance the simulation one step
+        if do_profile:
+            t0 = time.perf_counter()
         self.sim.step()
+        if do_profile:
+            self._profile["sim_step"] += time.perf_counter() - t0
 
         # Build observation and compute reward
+        if do_profile:
+            t0 = time.perf_counter()
         observation = self._get_observation()
-        reward, terminated, info = self._compute_reward(observation)
+        if do_profile:
+            self._profile["observation"] += time.perf_counter() - t0
+
+        if do_profile:
+            t0 = time.perf_counter()
+        reward, terminated, info = self._compute_reward(observation, action)
+        if do_profile:
+            self._profile["reward"] += time.perf_counter() - t0
         truncated = self.step_count >= self.max_steps
+
+        # Remember this step's action for next step's smoothness penalty
+        self.prev_action = action.astype(np.float32, copy=True)
 
         # Attach step diagnostics
         info['step'] = self.step_count
         info['visited_cells'] = len(self.visited_cells)
-        info['min_lidar'] = float(np.min(observation[:4]))
+        info['min_lidar'] = float(np.min(observation[:self.lidar_dim]))
+
+        if do_profile:
+            self._profile["steps"] += 1
+            self._profile["total"] += time.perf_counter() - t_total_start
+
+            if self._profile["steps"] % self.profile_every == 0:
+                steps = self._profile["steps"]
+                def ms(key):
+                    return (self._profile[key] / steps) * 1000.0
+
+                print(
+                    "Timing avg (ms/step) | "
+                    f"total {ms('total'):.2f} | "
+                    f"target {ms('target_move'):.2f} | "
+                    f"sim.step {ms('sim_step'):.2f} | "
+                    f"obs {ms('observation'):.2f} | "
+                    f"reward {ms('reward'):.2f}"
+                )
 
         return observation, reward, terminated, truncated, info
 
