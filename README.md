@@ -6,7 +6,7 @@ Reinforcement learning system that trains a quadcopter in CoppeliaSim to autonom
 
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
-- [CoppeliaSim Scene Setup](#coppeliasim-scene-setup)
+- [CoppeliaSim Setup](#coppeliasim-setup)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
 - [Project Structure](#project-structure)
@@ -33,9 +33,25 @@ pip install -r requirements.txt
 
 See [Palmetto Cluster Setup](#palmetto-cluster-setup-clemson-hpc).
 
-## CoppeliaSim Scene Setup
+## CoppeliaSim Setup
 
-The scene (`CoppeliaSim Drone Follower.ttt`) must contain:
+### Installing CoppeliaSim (quick start)
+
+1. **Download** the EDU (free for academic use) or Player edition from the [official downloads page](https://www.coppeliarobotics.com/downloads). This project targets **V4.10.0** — newer versions should work but haven't been tested.
+2. **Install** using the installer for your OS (Windows `.exe`, Mac `.dmg`, or Linux `.tar.xz`).
+3. **Launch** CoppeliaSim and confirm it opens to an empty scene without errors.
+
+### Opening the project scene
+
+1. In CoppeliaSim, go to **File → Open Scene…**
+2. Navigate to the project folder and select **`CoppeliaSim Drone Follower.ttt`**
+3. Leave the simulation **stopped** (do not press the ▶ Start button) — the Python scripts will start and stop the sim automatically. You can see in the object hierarchy on the left that the scene contains `/Quadcopter`, `/target`, several trees, buildings, and walking humanoids.
+
+> **Before running any command** that talks to CoppeliaSim (`python train.py`, `python evaluate.py`, `python generate_spawn_map.py`, or `python train.py --test`), make sure CoppeliaSim is **open** with the scene file loaded. The Python side connects to the running CoppeliaSim process via ZMQ on port 23000.
+
+### Required scene contents
+
+The `CoppeliaSim Drone Follower.ttt` scene must contain:
 
 - `/Quadcopter` — drone model with a built-in flight script that chases a target dummy
 - `/target` — dummy the flight script follows (must be *non-detectable* so LiDAR ignores it)
