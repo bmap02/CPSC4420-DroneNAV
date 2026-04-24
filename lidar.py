@@ -1,29 +1,48 @@
+"""LiDAR depth-buffer reader with angular binning for obstacle avoidance.
+
+Each of the drone's four vision-sensor LiDARs (front, back, left, right)
+covers a 90-degree horizontal field of view.  The depth buffer from each
+sensor is split into ``num_bins`` vertical column slices, and the minimum
+valid depth in each slice becomes one element of the observation vector.
+
+With 4 sensors x 4 bins the agent receives 16 angular distance features
+spanning the full 360 degrees at ~22.5 degrees per bin.
+"""
+
 import numpy as np
 
 
+# ── Constants ──
+
+MIN_VALID_DEPTH = 0.01
+"""Minimum depth value (metres) treated as a real reading.
+
+Values at or below this threshold are discarded as sensor noise or
+zero-returns from rays that missed all geometry.
+"""
+
 # ── Default sensor paths for all 4 LiDAR sensors ──
 LIDAR_SENSOR_PATHS = {
-    'F': '/Quadcopter/base/lidarFront/body/sensor',   # Front sensor
-    'B': '/Quadcopter/base/lidarBack/body/sensor',     # Back sensor
-    'L': '/Quadcopter/base/lidarLeft/body/sensor',     # Left sensor
-    'R': '/Quadcopter/base/lidarRight/body/sensor',    # Right sensor
+    "F": "/Quadcopter/base/lidarFront/body/sensor",   # Front sensor
+    "B": "/Quadcopter/base/lidarBack/body/sensor",     # Back sensor
+    "L": "/Quadcopter/base/lidarLeft/body/sensor",     # Left sensor
+    "R": "/Quadcopter/base/lidarRight/body/sensor",    # Right sensor
 }
 
-DEFAULT_MAX_RANGE = 5.0                                # Return value when no valid reading (m)
+DEFAULT_MAX_RANGE = 5.0  # Return value when no valid reading (m)
 
 
 def set_lidar_resolution(sim, lidar_handles, resolution):
-    """
-    Attempts to set the resolution of each LiDAR vision sensor.
+    """Attempts to set the resolution of each LiDAR vision sensor.
 
-    Note: This depends on the CoppeliaSim API exposing the
-    vision sensor integer params in the remote API.
+    This depends on the CoppeliaSim API exposing the vision-sensor
+    integer params in the remote API.
 
     Args:
         sim: CoppeliaSim remote API object.
-        lidar_handles (dict[str, int]): Sensor handle map.
-        resolution (int | None): Desired square resolution (e.g., 32).
-            If None or <= 0, no change is applied.
+        lidar_handles: Mapping of sensor name to object handle.
+        resolution: Desired square resolution (e.g. 32).
+            If ``None`` or <= 0, no change is applied.
     """
     if resolution is None or resolution <= 0:
         return
@@ -44,19 +63,18 @@ def set_lidar_resolution(sim, lidar_handles, resolution):
 
 
 def get_lidar_handles(sim, sensor_paths=None):
-    """
-    Loads all LiDAR sensor handles from CoppeliaSim.
+    """Loads all LiDAR sensor handles from CoppeliaSim.
 
-    Looks up each sensor path in the scene and returns a
-    dictionary mapping sensor name to its object handle.
+    Looks up each sensor path in the scene and returns a dictionary
+    mapping sensor name to its object handle.
 
     Args:
         sim: CoppeliaSim remote API object.
-        sensor_paths (dict[str, str], optional): Mapping of sensor
-            name to its scene path. Defaults to LIDAR_SENSOR_PATHS.
+        sensor_paths: Mapping of sensor name to scene path.
+            Defaults to ``LIDAR_SENSOR_PATHS``.
 
     Returns:
-        dict[str, int]: Mapping of sensor name to its object handle.
+        Dictionary mapping sensor name to its integer object handle.
     """
     if sensor_paths is None:
         sensor_paths = LIDAR_SENSOR_PATHS
@@ -68,9 +86,15 @@ def get_lidar_handles(sim, sensor_paths=None):
 
 
 def _get_depth_buffer(sim, lidar_handle):
-    """
-    Reads the raw depth buffer from a vision sensor and returns it
-    as a 2D numpy array (rows x cols).  Returns None on failure.
+    """Reads the raw depth buffer from a vision sensor.
+
+    Args:
+        sim: CoppeliaSim remote API object.
+        lidar_handle: Integer handle of the vision sensor.
+
+    Returns:
+        A 2-D numpy array of shape ``(rows, cols)`` containing
+        normalised depth values, or ``None`` on failure.
     """
     try:
         result = sim.getVisionSensorDepth(lidar_handle, 0)
@@ -86,20 +110,30 @@ def _get_depth_buffer(sim, lidar_handle):
         return depth_array.reshape(rows, cols)
 
     except Exception as e:
-        print(f'  LiDAR read error: {e}')
+        print(f"  LiDAR read error: {e}")
         return None
 
 
 def get_lidar_min_distance(sim, lidar_handle, max_range=DEFAULT_MAX_RANGE):
-    """
-    Returns the single minimum valid depth from a vision sensor.
-    Legacy 1-scalar-per-sensor reader.
+    """Returns the single minimum valid depth from a vision sensor.
+
+    This is the legacy 1-scalar-per-sensor reader kept for backward
+    compatibility when ``num_bins=1``.
+
+    Args:
+        sim: CoppeliaSim remote API object.
+        lidar_handle: Integer handle of the vision sensor.
+        max_range: Value returned when no valid reading exists.
+
+    Returns:
+        The minimum depth (float) above ``MIN_VALID_DEPTH``, or
+        *max_range* if no valid pixel is found.
     """
     buf = _get_depth_buffer(sim, lidar_handle)
     if buf is None:
         return max_range
 
-    valid = buf[buf > 0.01]
+    valid = buf[buf > MIN_VALID_DEPTH]
     if len(valid) == 0:
         return max_range
 
@@ -108,8 +142,7 @@ def get_lidar_min_distance(sim, lidar_handle, max_range=DEFAULT_MAX_RANGE):
 
 def get_lidar_binned_distances(sim, lidar_handle, num_bins=4,
                                 max_range=DEFAULT_MAX_RANGE):
-    """
-    Returns per-column-bin minimum depths from a vision sensor.
+    """Returns per-column-bin minimum depths from a vision sensor.
 
     Splits the depth buffer into *num_bins* vertical column slices
     (left-to-right across the sensor's horizontal FOV) and returns
@@ -118,12 +151,13 @@ def get_lidar_binned_distances(sim, lidar_handle, num_bins=4,
 
     Args:
         sim: CoppeliaSim remote API object.
-        lidar_handle (int): Vision sensor handle.
-        num_bins (int): Number of horizontal angular bins.
-        max_range (float): Value for bins with no valid reading.
+        lidar_handle: Integer handle of the vision sensor.
+        num_bins: Number of horizontal angular bins.
+        max_range: Value for bins with no valid reading.
 
     Returns:
-        np.ndarray: Shape (num_bins,) float32 array of distances.
+        A float32 numpy array of shape ``(num_bins,)`` containing
+        the minimum valid depth per angular bin.
     """
     buf = _get_depth_buffer(sim, lidar_handle)
     if buf is None:
@@ -137,7 +171,7 @@ def get_lidar_binned_distances(sim, lidar_handle, num_bins=4,
         start = i * bin_width
         end = start + bin_width if i < num_bins - 1 else cols
         col_slice = buf[:, start:end]
-        valid = col_slice[col_slice > 0.01]
+        valid = col_slice[col_slice > MIN_VALID_DEPTH]
         if len(valid) > 0:
             result[i] = float(np.min(valid))
 
@@ -145,36 +179,35 @@ def get_lidar_binned_distances(sim, lidar_handle, num_bins=4,
 
 
 def read_lidar_array(sim, lidar_handles, num_bins=1):
-    """
-    Reads all 4 LiDAR sensors and returns distances as a numpy array.
+    """Reads all 4 LiDAR sensors and returns distances as a numpy array.
 
-    With num_bins=1 (default), returns shape (4,) — one min per sensor
-    (legacy behaviour).
+    With ``num_bins=1`` (default) returns shape ``(4,)`` -- one minimum
+    distance per sensor (legacy behaviour).
 
-    With num_bins=N, returns shape (4*N,) — N angular bins per sensor
-    in order [F_bin0..F_binN-1, B_..., L_..., R_...].
+    With ``num_bins=N`` returns shape ``(4*N,)`` -- *N* angular bins per
+    sensor in order ``[F_bin0..F_binN-1, B_..., L_..., R_...]``.
 
     Args:
         sim: CoppeliaSim remote API object.
-        lidar_handles (dict[str, int]): Must contain 'F', 'B', 'L', 'R'.
-        num_bins (int): Angular bins per sensor. 1 = legacy single-min.
+        lidar_handles: Dictionary with keys ``'F'``, ``'B'``, ``'L'``,
+            ``'R'`` mapping to integer sensor handles.
+        num_bins: Angular bins per sensor.  1 = legacy single-min.
 
     Returns:
-        np.ndarray: Shape (4*num_bins,) float32 distances in metres.
+        A float32 numpy array of shape ``(4*num_bins,)`` with
+        distances in metres.
     """
     if num_bins <= 1:
         return np.array([
-            get_lidar_min_distance(sim, lidar_handles['F']),
-            get_lidar_min_distance(sim, lidar_handles['B']),
-            get_lidar_min_distance(sim, lidar_handles['L']),
-            get_lidar_min_distance(sim, lidar_handles['R']),
+            get_lidar_min_distance(sim, lidar_handles["F"]),
+            get_lidar_min_distance(sim, lidar_handles["B"]),
+            get_lidar_min_distance(sim, lidar_handles["L"]),
+            get_lidar_min_distance(sim, lidar_handles["R"]),
         ], dtype=np.float32)
 
     return np.concatenate([
-        get_lidar_binned_distances(sim, lidar_handles['F'], num_bins),
-        get_lidar_binned_distances(sim, lidar_handles['B'], num_bins),
-        get_lidar_binned_distances(sim, lidar_handles['L'], num_bins),
-        get_lidar_binned_distances(sim, lidar_handles['R'], num_bins),
+        get_lidar_binned_distances(sim, lidar_handles["F"], num_bins),
+        get_lidar_binned_distances(sim, lidar_handles["B"], num_bins),
+        get_lidar_binned_distances(sim, lidar_handles["L"], num_bins),
+        get_lidar_binned_distances(sim, lidar_handles["R"], num_bins),
     ])
-
-
