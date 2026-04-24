@@ -23,8 +23,8 @@ env/
 logs/
 *.log
 
-# Model artifacts
-
+# Archive (pre-v6 artifacts, kept for reference but not tracked)
+archive/
 
 # OS/editor
 .DS_Store

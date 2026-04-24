@@ -1,147 +1,128 @@
-"""
-PPO training script for drone obstacle avoidance.
+"""PPO training pipeline for drone obstacle avoidance.
 
-The drone learns to fly freely through the environment, exploring
-while avoiding obstacles using LiDAR sensor input.
+Orchestrates the full training loop:
 
-Requirements:
-    pip install stable-baselines3 gymnasium numpy torch
+1. (Optional) Launch one or more headless CoppeliaSim instances.
+2. Build a vectorized Gymnasium environment with ``VecNormalize``.
+3. Create or resume a PPO model (stable-baselines3).
+4. Train for ``TOTAL_TIMESTEPS``, saving the model periodically.
+5. Save the final model and normalisation statistics.
 
-Usage:
-    Train:   python train.py
-    Resume:  python train.py --resume --model models/checkpoints/drone_ppo_10000_steps
-    Test:    python train.py --test
-    Custom:  python train.py --test --model models/checkpoints/drone_ppo_50000_steps
+Usage::
+
+    python train.py                                           # train from scratch
+    python train.py --final-name my_run                       # train with named output
+    python train.py --resume --model models/my_run            # resume training
+    python train.py --test --model models/my_run              # run one eval episode
 """
 
 import os
-import sys
 import platform
-import numpy as np
-import subprocess
-import time
 import signal
+import subprocess
+import sys
 import threading
+import time
+
+import numpy as np
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import (
-    BaseCallback,
-    CheckpointCallback,
-)
-from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 from stable_baselines3.common.vec_env import VecNormalize
 
 from drone_environment import DroneAvoidanceEnv
 
 
-
-#  Environment Config
+# ── Environment Config ──
 ENV_CONFIG = dict(
-    max_steps=2000,                    # Max steps before episode ends
-    speed_scale=0.1,                   # Scales agent action into movement
+    max_steps=2000,                    # Max steps before episode is truncated
+    speed_scale=0.1,                   # Multiplier from raw action to target-dummy displacement
     collision_distance=0.1,            # LiDAR distance that counts as a crash (m)
-    proximity_threshold=0.4,           # WAS 0.25 — bumped for longer push-back gradient
+    proximity_threshold=0.4,           # Distance below which proximity penalty applies (m)
     boundary_min=-9.0,                 # Min x/y boundary of the flying area (m)
     boundary_max=9.0,                  # Max x/y boundary of the flying area (m)
     min_altitude=0.5,                  # Lowest allowed flight height (m)
     max_altitude=2.5,                  # Highest allowed flight height (m)
     flight_height=1.5,                 # Starting flight height (m)
-    ideal_altitude=1.5,                # Ideal cruising altitude — rewarded for staying near (m)
+    ideal_altitude=1.5,                # Ideal cruising altitude -- rewarded for staying near (m)
     exploration_grid_size=0.5,         # Size of grid cells for exploration tracking (m)
-    lidar_bins=4,                      # Angular bins per sensor (4 bins × 4 sensors = 16 features)
+    lidar_bins=4,                      # Angular bins per sensor (4 bins x 4 sensors = 16 features)
 
-    # ── Reward weights (Step 1 rebalance) ───────────────────────────────
-    # Goal: break the "big perimeter circle" attractor by removing the
-    # per-step movement bonus, sharpening the proximity penalty to a
-    # quadratic near-collision shape, softening the altitude band so it
-    # doesn't drown out coverage signal, and adding an action-smoothness
-    # penalty to suppress twitchy control. See plan §11 Step 1.
+    # ── Reward weights ──
     survival_reward=0.3,               # Per-step bonus for staying alive
     exploration_reward=20.0,           # One-shot bonus for visiting a new grid cell
-    movement_reward=0.0,               # WAS 4.0 — deleted to break big-circle attractor
-    stagnation_start=20,               # Steps in one cell before stagnation accrues
-    stagnation_rate=0.3,               # Per-step stagnation penalty accrual
-    stagnation_cap=8.0,                # Max stagnation penalty per step
-    proximity_penalty_scale=25.0,      # WAS 3.5 — stronger, re-tuned for 0.25m threshold
-    proximity_penalty_quadratic=True,  # WAS False — quadratic shape, dominates near d=0
+    movement_reward=0.0,               # Per-step bonus when horizontal speed > 0.1 m/s (disabled)
+    stagnation_start=20,               # Steps in one cell before stagnation penalty accrues
+    stagnation_rate=0.3,               # Per-step stagnation penalty accrual rate
+    stagnation_cap=8.0,                # Maximum stagnation penalty per step
+    proximity_penalty_scale=25.0,      # Multiplier on the proximity penalty
+    proximity_penalty_quadratic=True,  # Use quadratic (True) or linear (False) penalty shape
     collision_penalty=60.0,            # Terminal penalty for hitting an obstacle
     out_of_bounds_penalty=50.0,        # Terminal penalty for leaving the flight volume
-    hovering_penalty=0.0,              # WAS 1.0 — deleted alongside movement bonus
-    altitude_bonus=0.5,                # Bonus inside the altitude soft band
-    altitude_soft_band=0.5,            # WAS 0.3 — widened so altitude isn't the main gradient
-    altitude_linear_band=1.0,          # Linear-region half-width (m)
-    altitude_linear_scale=1.0,         # WAS 0.3 — bumped for clearer gradient against going high
-    altitude_quadratic_scale=2.0,      # WAS 0.5 — sharpened for steeper penalty near altitude limits
-    action_smoothness_scale=0.02,      # NEW — penalty on ||a_t - a_{t-1}||^2
-    boundary_warning_distance=0.7,     # NEW — penalty ramps up within 0.7m of any edge
-    boundary_penalty_scale=2.0,        # NEW — multiplier on boundary proximity penalty
-    # ────────────────────────────────────────────────────────────────────
+    hovering_penalty=0.0,              # Per-step penalty when horizontal speed < 0.1 m/s (disabled)
+    altitude_bonus=0.5,                # Bonus when inside the altitude soft band
+    altitude_soft_band=0.5,            # Half-width of the "free altitude" zone around ideal (m)
+    altitude_linear_band=1.0,          # Beyond soft band, linear penalty up to this delta (m)
+    altitude_linear_scale=1.0,         # Linear altitude-penalty multiplier
+    altitude_quadratic_scale=2.0,      # Quadratic altitude-penalty multiplier beyond linear band
+    action_smoothness_scale=0.02,      # Penalty on ||a_t - a_{t-1}||^2 (0 = disabled)
+    boundary_warning_distance=0.7,     # Distance from edge where boundary penalty begins (m)
+    boundary_penalty_scale=2.0,        # Multiplier on the boundary proximity penalty
 
-    # ── Spawn randomization (Step 3) ────────────────────────────────────
-    # Breaks the fixed-start attractor by spawning the drone at a random
-    # (x, y) each episode. Spawn area is boundary ± margin.
-    randomize_start_pose=True,         # NEW — random spawn each reset
-    spawn_margin=2.0,                  # Inset from boundaries (m), spawn in [-7, 7]
-    spawn_map_path="spawn_map.npy",   # Pre-computed safe spawns (None = rejection sampling)
-    # ────────────────────────────────────────────────────────────────────
+    # ── Spawn randomization ──
+    randomize_start_pose=True,         # Sample a random (x, y) each reset
+    spawn_margin=2.0,                  # Inset from boundaries for spawn area (m)
+    spawn_map_path="spawn_map.npy",    # Pre-computed safe spawns (None = rejection sampling)
 
-    disable_visualization=True,        # Toggle visualization off on reset
-    lidar_resolution=16,               # Vision sensor resolution (square)
+    # ── Sim / IO ──
+    disable_visualization=False,       # Toggle viewport rendering off on reset
+    lidar_resolution=16,               # Vision sensor resolution (square, pixels)
 )
 
 
-#  PPO parameters
+# ── PPO Hyperparameters ──
 PPO_CONFIG = dict(
-    learning_rate=3e-4,                # WAS 5e-4 — lowered to fix high approx_kl with VecNormalize
-    n_steps=256,                      # Steps per rollout before policy update (× NUM_ENVS = total)
+    learning_rate=3e-4,                # Adam learning rate
+    n_steps=256,                       # Steps per rollout before policy update (x NUM_ENVS = total)
     batch_size=64,                     # Minibatch size for each gradient step
-    n_epochs=5,                        # WAS 10 — fewer epochs = less cumulative KL drift per update
-    gamma=0.995,                       # WAS 0.98 — longer planning horizon (~200 steps / 10s at 50ms dt)
+    n_epochs=5,                        # SGD passes over each rollout buffer
+    gamma=0.995,                       # Discount factor (~200-step effective horizon)
     gae_lambda=0.95,                   # GAE lambda for advantage estimation
-    clip_range=0.2,                    # PPO clipping range for policy updates
-    ent_coef=0.005,                    # WAS 0.01 — lowered so policy can commit (std kept rising in v10/v11)
-    vf_coef=0.5,                       # Value function loss weight
+    clip_range=0.2,                    # PPO clipping range for policy ratio
+    ent_coef=0.005,                    # Entropy bonus coefficient (exploration vs. commitment)
+    vf_coef=0.5,                       # Value-function loss weight
     max_grad_norm=0.5,                 # Max gradient norm for clipping
-    target_kl=0.04,                    # WAS 0.03 — raised to give more headroom (effective cutoff = 1.5x = 0.06)
+    target_kl=0.04,                    # Early-stop threshold on approx KL divergence
 )
 
-#  Evaluation Config
-EVAL_CONFIG = dict(
-    enabled=False,                      # Enable evaluation runs
-    eval_freq=5000,                    # Evaluate every N training timesteps
-    n_eval_episodes=1,                 # Number of eval episodes per check
-    seed=123,                          # Base seed for eval episodes
-    use_separate_env=True,             # Use a dedicated eval sim instance
-)
-
-#  Training Config
+# ── Training Config ──
 TOTAL_TIMESTEPS = 500_000              # Total training timesteps
-CHECKPOINT_FREQ = 10_000               # Save model every N steps
-LATEST_SAVE_FREQ = 5_000               # Overwrite latest model every N steps
+SAVE_FREQ = 5_000                      # Overwrite latest model + stats every N steps
 HIDDEN_LAYERS = [256, 256]             # Policy and value network architecture
 DEVICE = "cpu"                         # Device to train on ("cpu", "cuda", or "auto")
 FINAL_MODEL_NAME = ""                  # Optional name (no extension). Example: "drone_ppo_run1"
 
-#  Multi-instance Config
-NUM_ENVS = 16                           # Number of parallel sims
+# ── Multi-instance Config ──
+NUM_ENVS = 1                           # Number of parallel sims
 BASE_PORT = 23000                      # First ZMQ RPC port
 PORT_STRIDE = 2                        # Port increment per instance
 HOST = "localhost"
 
-#  Optional: Launch CoppeliaSim instances from Python
-#  Detects platform and sets paths accordingly
+# ── Optional: Launch CoppeliaSim instances from Python ──
+# Detects platform and sets paths accordingly.
+_project_dir = os.path.dirname(os.path.abspath(__file__))
+
 if platform.system() == "Windows":
     LAUNCH_CONFIG = dict(
         enable=False,
         sim_exe_path="C:/Program Files/CoppeliaRobotics/CoppeliaSimEdu/coppeliaSim.exe",
-        scene_path="C:/Users/jack/Documents/Github/CPSC4420-DroneNAV/CoppeliaSim Drone Follower.ttt",
+        scene_path=os.path.join(_project_dir, "CoppeliaSim Drone Follower.ttt"),
         headless=False,
         launch_delay=2.0,
     )
 else:
     # Linux / Palmetto cluster (inside Apptainer container)
-    _project_dir = os.path.dirname(os.path.abspath(__file__))
     LAUNCH_CONFIG = dict(
         enable=True,
         sim_exe_path="/opt/coppeliasim/coppeliaSim",
@@ -159,11 +140,11 @@ LAUNCHED_PROCS = []
 
 
 class TrainingMetricsCallback(BaseCallback):
-    """
-    Custom callback that logs additional metrics during training.
+    """Logs additional per-step metrics to TensorBoard.
 
-    Tracks collision count, visited grid cells, and minimum LiDAR
-    distance per step for TensorBoard monitoring.
+    Tracks cumulative collision count, visited grid cells, and
+    the minimum LiDAR reading so training progress can be
+    monitored beyond the default SB3 scalars.
     """
 
     def __init__(self, verbose=0):
@@ -171,12 +152,10 @@ class TrainingMetricsCallback(BaseCallback):
         self.episode_count = 0
 
     def _on_step(self) -> bool:
-        """
-        Called at every training step. Extracts info from
-        completed episodes and records custom metrics.
+        """Extracts info dicts and records custom metrics.
 
         Returns:
-            bool: Always True (continue training).
+            Always ``True`` (never stops training early).
         """
         infos = self.locals.get("infos", [])
         for info in infos:
@@ -190,85 +169,18 @@ class TrainingMetricsCallback(BaseCallback):
         return True
 
 
-class EvalMetricsCallback(BaseCallback):
-    """
-    Periodically runs deterministic evaluation episodes and logs
-    clean metrics to TensorBoard for easy comparison between runs.
-    """
-
-    def __init__(self, eval_env, eval_freq, n_eval_episodes=1, seed=0, verbose=0):
-        super().__init__(verbose)
-        self.eval_env = eval_env
-        self.eval_freq = int(eval_freq)
-        self.n_eval_episodes = int(n_eval_episodes)
-        self.seed = int(seed)
-        self._last_eval_timestep = 0
-
-    def _on_rollout_end(self) -> None:
-        if self.num_timesteps - self._last_eval_timestep < self.eval_freq:
-            return
-
-        self._last_eval_timestep = self.num_timesteps
-
-        rewards = []
-        lengths = []
-        min_lidars = []
-        visited_cells = []
-        collisions = 0
-        total_steps = 0
-
-        for i in range(self.n_eval_episodes):
-            obs, info = self.eval_env.reset(seed=self.seed + i)
-            done = False
-            ep_reward = 0.0
-            ep_len = 0
-            ep_min_lidar = float("inf")
-            ep_visited = 0
-
-            while not done:
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = self.eval_env.step(action)
-                ep_reward += reward
-                ep_len += 1
-                total_steps += 1
-
-                if "min_lidar" in info:
-                    ep_min_lidar = min(ep_min_lidar, float(info["min_lidar"]))
-                if info.get("collision"):
-                    collisions += 1
-                if "visited_cells" in info:
-                    ep_visited = info["visited_cells"]
-
-                done = terminated or truncated
-
-            rewards.append(ep_reward)
-            lengths.append(ep_len)
-            min_lidars.append(ep_min_lidar if ep_min_lidar != float("inf") else 0.0)
-            visited_cells.append(ep_visited)
-
-        mean_reward = float(np.mean(rewards)) if rewards else 0.0
-        mean_len = float(np.mean(lengths)) if lengths else 0.0
-        mean_min_lidar = float(np.mean(min_lidars)) if min_lidars else 0.0
-        mean_visited = float(np.mean(visited_cells)) if visited_cells else 0.0
-        collisions_per_1k = (collisions / total_steps * 1000.0) if total_steps > 0 else 0.0
-
-        self.logger.record("eval/mean_reward", mean_reward)
-        self.logger.record("eval/mean_ep_len", mean_len)
-        self.logger.record("eval/mean_visited_cells", mean_visited)
-        self.logger.record("eval/min_lidar", mean_min_lidar)
-        self.logger.record("eval/collisions_per_1k_steps", collisions_per_1k)
-
-    def _on_training_end(self) -> None:
-        try:
-            self.eval_env.close()
-        except Exception:
-            pass
-
-
 class PeriodicSaveCallback(BaseCallback):
-    """
-    Periodically saves/overwrites a "latest" model file and
-    the VecNormalize running statistics alongside it.
+    """Overwrites a "latest" model checkpoint at a fixed interval.
+
+    Also saves the ``VecNormalize`` running statistics so that a
+    resumed or evaluated model gets the correct normalisation.
+
+    Args:
+        save_freq: Save every this many timesteps.
+        save_path: Destination path for the model file.
+        stats_path: Destination path for VecNormalize stats
+            (optional; skipped if ``None``).
+        verbose: Verbosity level.
     """
 
     def __init__(self, save_freq, save_path, stats_path=None, verbose=0):
@@ -278,6 +190,7 @@ class PeriodicSaveCallback(BaseCallback):
         self.stats_path = stats_path
 
     def _on_step(self) -> bool:
+        """Saves the model and stats if the interval has elapsed."""
         if self.num_timesteps % self.save_freq == 0:
             try:
                 self.model.save(self.save_path)
@@ -290,7 +203,15 @@ class PeriodicSaveCallback(BaseCallback):
 
 
 def make_env_fn(rank, port):
-    """Returns a zero-arg factory that creates a DroneAvoidanceEnv on *port*."""
+    """Returns a zero-arg factory that creates a ``DroneAvoidanceEnv`` on *port*.
+
+    Args:
+        rank: Index of this environment (unused, kept for SubprocVecEnv).
+        port: ZMQ remote-API port to connect to.
+
+    Returns:
+        A callable that produces a configured ``DroneAvoidanceEnv``.
+    """
     def _init():
         env = DroneAvoidanceEnv(**ENV_CONFIG, host=HOST, port=port)
         return env
@@ -298,19 +219,20 @@ def make_env_fn(rank, port):
 
 
 def build_vec_env(normalize=True):
-    """
-    Builds a vectorized environment, optionally wrapped in VecNormalize.
+    """Builds a vectorized environment, optionally wrapped in VecNormalize.
 
-    NUM_ENVS >= 2  →  SubprocVecEnv  (one process per sim)
-    NUM_ENVS == 1  →  DummyVecEnv    (single process, easier to debug)
+    ``NUM_ENVS >= 2`` uses ``SubprocVecEnv`` (one process per sim);
+    ``NUM_ENVS == 1`` uses ``DummyVecEnv`` (easier to debug).
 
     Args:
-        normalize: If True (default), wrap with VecNormalize for
-            obs + reward normalization.  Pass False when you plan
-            to load saved VecNormalize stats via VecNormalize.load().
+        normalize: If ``True`` (default), wrap with ``VecNormalize``
+            for observation and reward normalization.  Pass ``False``
+            when you plan to load saved stats via
+            ``VecNormalize.load()``.
 
     Returns:
-        VecNormalize or VecMonitor depending on *normalize*.
+        A ``VecNormalize`` or ``VecMonitor`` wrapper depending on
+        *normalize*.
     """
     if NUM_ENVS == 1:
         vec = DummyVecEnv([make_env_fn(0, BASE_PORT)])
@@ -326,6 +248,12 @@ def build_vec_env(normalize=True):
 
 
 def launch_coppeliasim_instances():
+    """Spawns headless CoppeliaSim processes for each env slot.
+
+    Each instance listens on its own ZMQ port (``BASE_PORT + i *
+    PORT_STRIDE``).  Launched processes are tracked in
+    ``LAUNCHED_PROCS`` for cleanup on exit.
+    """
     if not LAUNCH_CONFIG["enable"]:
         return
 
@@ -334,11 +262,7 @@ def launch_coppeliasim_instances():
     if not sim_exe or not scene:
         raise ValueError("LAUNCH_CONFIG requires sim_exe_path and scene_path when enabled.")
 
-    total_instances = NUM_ENVS
-    if EVAL_CONFIG["enabled"] and EVAL_CONFIG["use_separate_env"]:
-        total_instances += 1
-
-    for i in range(total_instances):
+    for i in range(NUM_ENVS):
         port = BASE_PORT + i * PORT_STRIDE
         args = []
         # On Linux, wrap with xvfb-run for headless OpenGL rendering
@@ -355,24 +279,19 @@ def launch_coppeliasim_instances():
 
 
 def train(resume_path=None):
-    """
-    Runs PPO training.
+    """Runs the full PPO training loop.
 
     Creates the environment, builds the PPO model with the
-    configured hyperparameters, and trains for TOTAL_TIMESTEPS.
-    Saves checkpoints every CHECKPOINT_FREQ steps and a final
-    model when training completes or is interrupted with Ctrl+C.
-
-    If resume_path is provided, loads a previously saved model
-    and continues training from where it left off.
+    configured hyperparameters, and trains for ``TOTAL_TIMESTEPS``.
+    Saves the model and VecNormalize stats every ``SAVE_FREQ``
+    steps and on completion or Ctrl+C interrupt.
 
     Args:
-        resume_path (str, optional): Path to a saved model to
-            resume training from (without .zip extension).
+        resume_path: Path to a saved model to resume from
+            (without ``.zip`` extension).  ``None`` starts fresh.
     """
 
     os.makedirs("models", exist_ok=True)
-    os.makedirs("models/checkpoints", exist_ok=True)
     os.makedirs("stats", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
@@ -400,15 +319,6 @@ def train(resume_path=None):
         env = VecNormalize.load(stats_path, build_vec_env(normalize=False))
     else:
         env = build_vec_env(normalize=True)
-
-    eval_env = None
-    if EVAL_CONFIG["enabled"]:
-        if NUM_ENVS > 1 and EVAL_CONFIG["use_separate_env"]:
-            eval_port = BASE_PORT + NUM_ENVS * PORT_STRIDE
-            eval_env = DroneAvoidanceEnv(**ENV_CONFIG, host=HOST, port=eval_port)
-            eval_env = Monitor(eval_env)
-        else:
-            print("Eval disabled: set EVAL_CONFIG['use_separate_env']=True and NUM_ENVS>1.")
 
     # PPO Model — load existing or create new
     if resume_path:
@@ -453,23 +363,10 @@ def train(resume_path=None):
     print("=" * 60 + "\n")
 
     # ── Callbacks ──
-    checkpoint_cb = CheckpointCallback(
-        save_freq=CHECKPOINT_FREQ,
-        save_path="./models/checkpoints/",
-        name_prefix="drone_ppo",
-    )
     metrics_cb = TrainingMetricsCallback()
-    eval_cb = None
-    if EVAL_CONFIG["enabled"] and eval_env is not None:
-        eval_cb = EvalMetricsCallback(
-            eval_env=eval_env,
-            eval_freq=EVAL_CONFIG["eval_freq"],
-            n_eval_episodes=EVAL_CONFIG["n_eval_episodes"],
-            seed=EVAL_CONFIG["seed"],
-        )
     latest_path = f"models/{run_name}"
     latest_cb = PeriodicSaveCallback(
-        save_freq=LATEST_SAVE_FREQ,
+        save_freq=SAVE_FREQ,
         save_path=latest_path,
         stats_path=stats_path,
     )
@@ -504,6 +401,8 @@ def train(resume_path=None):
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, signal.SIG_IGN)
         print("\nStopping training and shutting down sims...")
+        # Start a 10-second watchdog: if graceful shutdown hangs (e.g.
+        # a ZMQ call blocks forever), force-exit the process.
         if not force_exit_timer["started"]:
             force_exit_timer["started"] = True
             threading.Timer(10.0, _force_exit).start()
@@ -520,9 +419,7 @@ def train(resume_path=None):
         signal.signal(signal.SIGBREAK, _cleanup_and_exit)
 
     try:
-        callbacks = [checkpoint_cb, metrics_cb, latest_cb]
-        if eval_cb is not None:
-            callbacks.append(eval_cb)
+        callbacks = [metrics_cb, latest_cb]
 
         model.learn(
             total_timesteps=TOTAL_TIMESTEPS,
@@ -544,7 +441,6 @@ def train(resume_path=None):
             print(f"Save failed: {e}")
     finally:
         if not shutdown_requested["flag"]:
-            _safe_close_env(eval_env)
             _safe_close_env(env)
         for proc in LAUNCHED_PROCS:
             try:
@@ -567,16 +463,15 @@ def train(resume_path=None):
 
 
 def test(model_path="models/drone_ppo_final"):
-    """
-    Runs a trained model in a single episode with deterministic actions.
+    """Runs a trained model for one episode with deterministic actions.
 
-    Builds a VecNormalize-wrapped env in eval mode, loads the saved
-    normalization stats alongside the model weights, and prints
-    live telemetry every 50 steps.
+    Builds a ``VecNormalize``-wrapped env in eval mode, loads the
+    saved normalisation stats alongside the model weights, and
+    prints live telemetry every 50 steps.
 
     Args:
-        model_path (str): Path to the saved model file
-            (without .zip extension).
+        model_path: Path to the saved model file (without ``.zip``
+            extension).
     """
     # Derive stats path from the model name
     run_name = os.path.basename(model_path)

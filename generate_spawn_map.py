@@ -1,40 +1,57 @@
-"""
-Generates a safe-spawn map by sweeping the drone across the entire map
-and recording which positions have clear lidar readings.
+"""Generate a safe-spawn map by sweeping the drone across the scene.
 
-Usage:
-    1. Open CoppeliaSim with the scene (do NOT start the simulation)
+The script teleports a *static* (non-dynamic) drone to every grid
+position at ``FLIGHT_HEIGHT`` and records which positions have clear
+LiDAR readings.  Positions where ``min(lidar) > SAFE_THRESHOLD`` are
+saved to ``spawn_map.npy`` as an Nx2 array of (x, y) coordinates.
+
+Strategy:
+    1. Disable the drone's flight script so the PID controller does
+       not fight the teleport.
+    2. Set the drone (and its respondable body) to *static* so
+       physics are frozen -- no gravity, no collisions, no tipping.
+    3. Teleport to each grid cell, step the sim once to update the
+       vision sensors, and read the LiDAR.
+    4. Restore dynamic mode and re-enable the flight script when done.
+
+SAFE_THRESHOLD should be >= ``proximity_threshold`` in ``train.py``
+``ENV_CONFIG`` so that no spawn puts the drone inside its own penalty
+zone on the very first step.
+
+Usage::
+
+    1. Open CoppeliaSim with the scene (do NOT start the simulation).
     2. Run:  python generate_spawn_map.py
     3. Output: spawn_map.npy + spawn_map_preview.txt
-
-The script:
-    - Makes the drone non-collidable so it doesn't interact with obstacles
-    - Teleports it to every 0.5m grid position at flight_height
-    - Reads lidar at each position
-    - Marks cells as safe (min_lidar > threshold) or unsafe
-    - Saves the result as a numpy array for use in drone_environment.py
 
 Requires one CoppeliaSim instance running on port 23000.
 """
 
-import numpy as np
 import time
+
+import numpy as np
+
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+
 from lidar import get_lidar_handles, read_lidar_array
 
 # ── Config ──
 HOST = "localhost"
 PORT = 23000
-GRID_STEP = 0.5          # metres between sweep positions
+GRID_STEP = 0.5          # Metres between sweep positions
 BOUNDARY_MIN = -8.0      # Inset from the actual flight bounds (+/-9) so
 BOUNDARY_MAX = 8.0       # spawns never land in the boundary warning zone
 FLIGHT_HEIGHT = 1.5
-SAFE_THRESHOLD = 0.25    # min_lidar above this = safe to spawn
+# Minimum LiDAR reading to consider a position safe.
+# Cross-ref: should be >= proximity_threshold in train.py ENV_CONFIG
+# so newly-spawned drones do not immediately incur a penalty.
+SAFE_THRESHOLD = 0.25
 OUTPUT_FILE = "spawn_map.npy"
 PREVIEW_FILE = "spawn_map_preview.txt"
 
 
 def main():
+    """Runs the full sweep and writes ``spawn_map.npy``."""
     print("Connecting to CoppeliaSim...")
     client = RemoteAPIClient(host=HOST, port=PORT)
     sim = client.require("sim")
@@ -62,12 +79,13 @@ def main():
     sim.startSimulation()
     time.sleep(0.5)
 
-    # Disable the flight script and make the drone non-dynamic (static).
-    # This freezes it in place — no gravity, no physics, no tipping over.
-    # It becomes a static sensor platform we just teleport around.
+    # Disable the flight script so the PID controller does not interfere
+    # with teleportation.  Making the drone static freezes it in place --
+    # no gravity, no physics, no tipping -- turning it into a pure sensor
+    # platform that we teleport around the grid.
     sim.setScriptInt32Param(flight_script, sim.scriptintparam_enabled, 0)
     sim.setObjectInt32Param(drone, sim.shapeintparam_static, 1)
-    # Also freeze the respondable body
+    # Also freeze the respondable body (collision hull)
     try:
         respondable = sim.getObject("/Quadcopter/respondable")
         sim.setObjectInt32Param(respondable, sim.shapeintparam_static, 1)
@@ -119,7 +137,7 @@ def main():
     print(f"\nDone: {len(safe_positions)}/{total} safe positions "
           f"({100*len(safe_positions)/total:.0f}%)")
 
-    # Save just the safe (x, y) coordinates — nothing to filter on load
+    # Save just the safe (x, y) coordinates
     np.save(OUTPUT_FILE, safe_positions)
     print(f"Saved: {OUTPUT_FILE}")
 

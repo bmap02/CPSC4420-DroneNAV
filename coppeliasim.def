@@ -1,0 +1,51 @@
+# ── Apptainer / Singularity container definition ──
+#
+# Builds a container with CoppeliaSim Edu V4.10.0 rev0 for Ubuntu 24.04
+# and all Python dependencies needed by the DroneNAV training pipeline.
+#
+# Build:
+#     apptainer build coppeliasim.sif coppeliasim.def
+#
+# Run (interactive):
+#     apptainer shell coppeliasim.sif
+#
+# Run (training):
+#     apptainer exec coppeliasim.sif python3 train.py
+#
+# The container uses xvfb for headless OpenGL rendering and sets
+# QT_QPA_PLATFORM=offscreen so CoppeliaSim does not require a display.
+#
+# Target: CoppeliaSim Edu V4.10.0 rev0 (Ubuntu 24.04, x86_64)
+
+Bootstrap: docker
+From: ubuntu:24.04
+
+%post
+    apt-get update && apt-get install -y \
+        wget tar xz-utils xvfb \
+        libx11-6 libxcb1 libgl1-mesa-dev \
+        libavcodec-dev libavformat-dev libswscale-dev \
+        python3 python3-pip python3-venv \
+        && rm -rf /var/lib/apt/lists/*
+
+    cd /opt
+    wget https://downloads.coppeliarobotics.com/V4_10_0_rev0/CoppeliaSim_Edu_V4_10_0_rev0_Ubuntu24_04.tar.xz
+    tar xf CoppeliaSim_Edu_V4_10_0_rev0_Ubuntu24_04.tar.xz
+    rm CoppeliaSim_Edu_V4_10_0_rev0_Ubuntu24_04.tar.xz
+    mv CoppeliaSim_Edu_V4_10_0_rev0_Ubuntu24_04 coppeliasim
+
+    pip3 install --no-cache-dir --break-system-packages \
+        coppeliasim-zmqremoteapi-client \
+        gymnasium numpy \
+        stable-baselines3 tensorboard \
+        torch --extra-index-url https://download.pytorch.org/whl/cpu \
+        rich tqdm
+
+%environment
+    export COPPELIASIM_ROOT=/opt/coppeliasim
+    export PATH=$COPPELIASIM_ROOT:$PATH
+    export LD_LIBRARY_PATH=$COPPELIASIM_ROOT:$LD_LIBRARY_PATH
+    export QT_QPA_PLATFORM=offscreen
+
+%runscript
+    exec "$@"

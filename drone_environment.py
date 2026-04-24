@@ -1,30 +1,34 @@
-"""
-Gymnasium environment for CoppeliaSim drone obstacle avoidance.
+"""Gymnasium environment for CoppeliaSim drone obstacle avoidance.
 
 The drone's goal is to fly freely, explore the environment, and
 avoid obstacles (trees, people, buildings) for as long as possible.
-No waypoints or destinations — purely learning-based navigation.
+No waypoints or destinations -- purely learning-based navigation.
 
-Follows the standard Gymnasium API:
-    env.reset()  → (observation, info)
-    env.step()   → (observation, reward, terminated, truncated, info)
+Follows the standard Gymnasium API::
 
-Observation (10D):
-    [0:4]  — 4 LiDAR distances (front, back, left, right)
-    [4:7]  — drone position (x, y, z)
-    [7:10] — drone velocity (vx, vy, vz)
+    env.reset()  -> (observation, info)
+    env.step()   -> (observation, reward, terminated, truncated, info)
 
-Action (3D):
+Observation (22-D by default):
+    [0:16]   -- 16 LiDAR angular-bin distances (4 sensors x 4 bins)
+    [16:19]  -- drone position (x, y, z)
+    [19:22]  -- drone velocity (vx, vy, vz)
+
+Exploration is tracked on a 2-D grid (x, y only); altitude is
+excluded so the drone cannot game coverage by climbing.
+
+Action (3-D):
     Velocity adjustments (dx, dy, dz) in [-1, 1], clipped and scaled
-    by speed_scale before being sent to the target dummy. No hand-coded
-    nudging — the policy is the sole source of control.
+    by ``speed_scale`` before being sent to the target dummy.  The
+    policy is the sole source of control -- no hand-coded nudging.
 
-Reward (all weights configurable via __init__ kwargs / train.py ENV_CONFIG):
+Reward (all weights configurable via ``__init__`` kwargs / ``train.py``
+``ENV_CONFIG``):
     + survival_reward          per step survived
     + exploration_reward       one-shot bonus for visiting a new grid cell
     + movement_reward          when horizontal speed > 0.1 m/s
     + altitude_bonus           when inside the altitude soft band
-    - proximity penalty        linear or quadratic in (proximity_threshold - min_lidar)
+    - proximity penalty        linear or quadratic in (threshold - min_lidar)
     - stagnation penalty       after camping in one cell too long
     - altitude penalty         linear then quadratic outside the soft band
     - hovering penalty         when horizontal speed < 0.1 m/s
@@ -34,8 +38,9 @@ Reward (all weights configurable via __init__ kwargs / train.py ENV_CONFIG):
 """
 
 import time
-import numpy as np
+
 import gymnasium as gym
+import numpy as np
 from gymnasium import spaces
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
@@ -45,13 +50,12 @@ from navigation import get_drone_pos_array, get_drone_velocity, set_target
 
 
 class DroneAvoidanceEnv(gym.Env):
-    """
-    CoppeliaSim drone environment for obstacle avoidance.
+    """CoppeliaSim drone environment for obstacle avoidance.
 
     Implements the standard Gymnasium Env interface so it can be
-    used with any compatible RL library (stable-baselines3, etc).
+    used with any compatible RL library (stable-baselines3, etc.).
 
-    The agent controls the drone's velocity in 3D space. Altitude
+    The agent controls the drone's velocity in 3-D space.  Altitude
     is clamped and penalized to discourage cheating by flying above
     obstacles.
     """
@@ -109,32 +113,35 @@ class DroneAvoidanceEnv(gym.Env):
         profile_every=0,                   # Print timing stats every N steps (0 disables)
         cntport=None,                      # Remote API control port (optional)
     ):
-        """
-        Initializes the drone environment.
+        """Initializes the drone environment.
 
         Sets up the observation and action spaces, stores all
         configuration parameters, and prepares internal state.
-        Does NOT connect to CoppeliaSim yet — that happens
-        on the first call to reset().
+        Does NOT connect to CoppeliaSim yet -- that happens on
+        the first call to ``reset()``.
+
+        All reward weights and episode parameters are passed in
+        as keyword arguments so that ``train.py``'s ``ENV_CONFIG``
+        dict is the single source of truth.
 
         Args:
-            max_steps (int): Max steps before episode is truncated.
-            speed_scale (float): Multiplier applied to actions.
-            collision_distance (float): LiDAR reading below this
-                triggers a crash and ends the episode.
-            proximity_threshold (float): LiDAR reading below which the
+            max_steps: Max steps before episode is truncated.
+            speed_scale: Multiplier applied to raw actions.
+            collision_distance: LiDAR reading below this triggers
+                a crash and ends the episode.
+            proximity_threshold: LiDAR reading below which the
                 proximity penalty starts accruing.
-            boundary_min (float): Min x/y world coordinate.
-            boundary_max (float): Max x/y world coordinate.
-            min_altitude (float): Minimum allowed z position.
-            max_altitude (float): Maximum allowed z position.
-            flight_height (float): Starting altitude on reset.
-            ideal_altitude (float): Ideal cruising altitude. The
-                agent is rewarded for staying near this height
-                and penalized for drifting away.
-            exploration_grid_size (float): Grid cell size for
-                tracking which areas the drone has visited.
-            render_mode (str, optional): Gymnasium render mode.
+            boundary_min: Min x/y world coordinate.
+            boundary_max: Max x/y world coordinate.
+            min_altitude: Minimum allowed z position.
+            max_altitude: Maximum allowed z position.
+            flight_height: Starting altitude on reset.
+            ideal_altitude: Ideal cruising altitude.  The agent
+                is rewarded for staying near this height and
+                penalized for drifting away.
+            exploration_grid_size: Grid cell size for tracking
+                which areas the drone has visited.
+            render_mode: Gymnasium render mode (optional).
         """
         super().__init__()
 
@@ -233,13 +240,12 @@ class DroneAvoidanceEnv(gym.Env):
             "total": 0.0,
         }
 
-    #  Connection
+    # ── Connection ──
     def _connect(self):
-        """
-        Establishes connection to CoppeliaSim.
+        """Establishes connection to CoppeliaSim.
 
         Grabs handles for the drone, target dummy, and all four
-        LiDAR sensors. Skips if already connected.
+        LiDAR sensors.  Skips if already connected.
         """
         if self._connected:
             return
@@ -257,8 +263,10 @@ class DroneAvoidanceEnv(gym.Env):
         self._connected = True
 
     def _apply_sim_settings(self):
-        """
-        Applies sim settings that tend to reset on simulation start.
+        """Applies sim settings that tend to reset on simulation start.
+
+        Disables the viewport renderer (if configured) and sets the
+        LiDAR vision-sensor resolution.
         """
         if self.disable_visualization and not self.headless:
             try:
@@ -269,20 +277,20 @@ class DroneAvoidanceEnv(gym.Env):
         if self.lidar_resolution:
             set_lidar_resolution(self.sim, self.lidar_handles, self.lidar_resolution)
 
-    #  Observation
+    # ── Observation ──
     def _get_observation(self):
-        """
-        Builds the 10D observation vector from the current sim state.
+        """Builds the observation vector from the current sim state.
 
         Reads all four LiDAR sensors, the drone's world position,
         and its linear velocity, then concatenates them into a
         single flat array.
 
         Returns:
-            np.ndarray: Shape (4*lidar_bins + 6,) float32 observation.
-                [0 : 4*lidar_bins]  — LiDAR angular bin distances (metres)
-                [... : ...+3]       — Drone position (x, y, z) in metres
-                [...+3 : ...+6]     — Drone velocity (vx, vy, vz) in m/s
+            A float32 numpy array of shape ``(obs_dim,)``::
+
+                [0 : 4*lidar_bins]  -- LiDAR angular bin distances (m)
+                [... : ...+3]       -- Drone position (x, y, z) in m
+                [...+3 : ...+6]     -- Drone velocity (vx, vy, vz) m/s
         """
         lidar = read_lidar_array(self.sim, self.lidar_handles,
                                  num_bins=self.lidar_bins)
@@ -292,59 +300,42 @@ class DroneAvoidanceEnv(gym.Env):
         return np.concatenate([lidar, pos, vel])
 
 
-    #  Exploration tracking
+    # ── Exploration tracking ──
     def _get_grid_cell(self, pos):
-        """
-        Converts a world position to a discrete 2D grid cell (x, y only).
+        """Converts a world position to a discrete 2-D grid cell.
 
-        Height is deliberately excluded so the drone can't game the
-        exploration reward by climbing to "new" altitude slices above
-        already-explored ground.  The altitude bonus/penalty handles
-        vertical behaviour separately.
+        Only x and y are used.  Height is deliberately excluded so the
+        drone cannot game the exploration reward by climbing to "new"
+        altitude slices above already-explored ground.
 
         Args:
-            pos (np.ndarray): ``[x, y, z]`` position in metres.
+            pos: ``[x, y, z]`` position array in metres.
 
         Returns:
-            tuple[int, int]: Grid cell indices (gx, gy).
+            A ``(gx, gy)`` tuple of integer grid-cell indices.
         """
         gx = int(pos[0] / self.exploration_grid_size)
         gy = int(pos[1] / self.exploration_grid_size)
         return (gx, gy)
 
 
-    #  Reward
+    # ── Reward ──
     def _compute_reward(self, obs, action):
-        """
-        Computes the reward for the current step.
+        """Computes the scalar reward for the current step.
 
-        All reward weights come from ``self`` attributes set in ``__init__``,
-        so they can be tuned from ``train.py`` without editing this file.
-        The reward signal is a combination of:
-            + survival bonus (awarded every step)
-            + exploration bonus (new grid cell visited, one-shot per cell)
-            + movement bonus (speed above 0.1 m/s)
-            + altitude bonus (within soft band of ideal altitude)
-            - proximity penalty (scales with closeness to obstacles)
-            - stagnation penalty (camping in one cell)
-            - altitude penalty (linear then quadratic outside soft band)
-            - hovering penalty (speed below 0.1 m/s)
-            - action smoothness penalty (||a_t - a_{t-1}||^2)
-            - collision (episode terminates)
-            - out of bounds (episode terminates)
+        All reward weights come from ``self`` attributes set in
+        ``__init__``, so they can be tuned from ``train.py``
+        without editing this file.
 
         Args:
-            obs (np.ndarray): Current 10D observation vector.
-            action (np.ndarray): The (clipped) raw action the policy
-                emitted this step, used for the smoothness penalty.
+            obs: Current observation vector.
+            action: The (clipped) raw action the policy emitted
+                this step, used for the smoothness penalty.
 
         Returns:
-            tuple[float, bool, dict]:
-                reward (float): Scalar reward value.
-                terminated (bool): Whether the episode ended
-                    due to collision or out of bounds.
-                info (dict): Additional diagnostics about what
-                    triggered the reward components.
+            A ``(reward, terminated, info)`` tuple where *reward*
+            is a float, *terminated* is ``True`` on collision or
+            out-of-bounds, and *info* is a diagnostics dict.
         """
         lidar = obs[:self.lidar_dim]
         pos = obs[self.lidar_dim:self.lidar_dim + 3]
@@ -449,26 +440,21 @@ class DroneAvoidanceEnv(gym.Env):
         return reward, terminated, info
 
 
-    #  Gymnasium API: reset
+    # ── Gymnasium API: reset ──
     def reset(self, seed=None, options=None):
-        """
-        Resets the environment for a new episode.
+        """Resets the environment for a new episode.
 
-        Follows the Gymnasium API:
-            observation, info = env.reset()
-
-        Stops any running simulation, restarts it, clears the
-        step counter and visited cells, and places the drone
-        at its starting flight height.
+        Stops any running simulation, restarts it, clears the step
+        counter and visited cells, and places the drone at its
+        starting flight height.
 
         Args:
-            seed (int, optional): Random seed for reproducibility.
-            options (dict, optional): Additional reset options.
+            seed: Random seed for reproducibility (optional).
+            options: Additional reset options (optional).
 
         Returns:
-            tuple[np.ndarray, dict]:
-                observation (np.ndarray): Initial 10D observation.
-                info (dict): Reset diagnostics.
+            A ``(observation, info)`` tuple following the Gymnasium
+            ``reset()`` contract.
         """
         # Initialize the RNG (Gymnasium requirement)
         super().reset(seed=seed)
@@ -542,34 +528,22 @@ class DroneAvoidanceEnv(gym.Env):
         return observation, info
 
 
-    #  Gymnasium API: step
+    # ── Gymnasium API: step ──
     def step(self, action):
-        """
-        Executes one environment step.
+        """Executes one environment step.
 
-        Follows the Gymnasium API:
-            observation, reward, terminated, truncated, info = env.step(action)
-
-        Clips the agent's action to [-1, 1], scales it by speed_scale,
-        and moves the drone's target position accordingly. Then steps
-        the simulation forward and computes the new observation and
-        reward.
+        Clips the agent's action to [-1, 1], scales it by
+        ``speed_scale``, and moves the drone's target position
+        accordingly.  Then steps the simulation forward and
+        computes the new observation and reward.
 
         Args:
-            action (np.ndarray): Shape (3,) array with values
-                in [-1, 1] representing velocity adjustments
-                in (x, y, z).
+            action: Shape ``(3,)`` array with values in [-1, 1]
+                representing velocity adjustments in (x, y, z).
 
         Returns:
-            tuple[np.ndarray, float, bool, bool, dict]:
-                observation (np.ndarray): New 10D observation.
-                reward (float): Reward for this step.
-                terminated (bool): True if episode ended due to
-                    collision or going out of bounds.
-                truncated (bool): True if episode was cut short
-                    because max_steps was reached.
-                info (dict): Step diagnostics including step
-                    count, visited cells, and min LiDAR reading.
+            A ``(observation, reward, terminated, truncated, info)``
+            tuple following the Gymnasium ``step()`` contract.
         """
         self.step_count += 1
 
@@ -653,13 +627,10 @@ class DroneAvoidanceEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
 
-    # ──────────────────────────────────────────────
-    #  Gymnasium API: close
-    # ──────────────────────────────────────────────
+    # ── Gymnasium API: close ──
 
     def close(self):
-        """
-        Stops the simulation and cleans up.
+        """Stops the simulation and cleans up.
 
         Safe to call even if the simulation is not running.
         Should be called when finished with the environment.

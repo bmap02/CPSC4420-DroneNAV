@@ -1,19 +1,37 @@
 # CoppeliaSim Drone Obstacle Avoidance
 
-Reinforcement learning for a quadcopter in CoppeliaSim that learns to explore a map and avoid static and dynamic obstacles using PPO and 4-direction LiDAR. The drone learns from experience — no waypoints, no scripted paths, no hand-coded avoidance rules. The policy's action is the sole source of control.
+Reinforcement learning system that trains a quadcopter in CoppeliaSim to autonomously explore a map and avoid static and dynamic obstacles using PPO and angular-binned LiDAR. The drone learns purely from experience — no waypoints, no scripted paths, no hand-coded avoidance rules.
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [CoppeliaSim Scene Setup](#coppeliasim-scene-setup)
+- [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
+- [Project Structure](#project-structure)
+- [Configuration](#configuration)
+- [Palmetto Cluster Setup](#palmetto-cluster-setup-clemson-hpc)
+- [Known Limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
 
 ## Prerequisites
 
-- [CoppeliaSim](https://www.coppeliarobotics.com/) (EDU or Player), 4.5+
+- [CoppeliaSim](https://www.coppeliarobotics.com/) EDU or Player (V4.10.0+)
 - Python 3.10+
-- NVIDIA GPU optional (CPU training works fine for the current network size)
+- GPU not required — training bottleneck is CoppeliaSim physics (CPU-bound), not the neural network
 
 ## Installation
 
+### Local (Windows / Mac)
+
 ```bash
-pip install coppeliasim-zmqremoteapi-client numpy gymnasium stable-baselines3 tensorboard rich tqdm
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
 ```
+
+### Palmetto (Clemson HPC)
+
+See [Palmetto Cluster Setup](#palmetto-cluster-setup-clemson-hpc).
 
 ## CoppeliaSim Scene Setup
 
@@ -27,56 +45,67 @@ The scene (`CoppeliaSim Drone Follower.ttt`) must contain:
 - `/Quadcopter/base/lidarRight/body/sensor` — right LiDAR vision sensor
 - Static obstacles (trees, buildings, etc.) and dynamic obstacles (animated people on paths)
 
-Each LiDAR sensor's FOV must be set to **90 degrees** in the Lua script under each `lidarX` object (`sysCall_init`, `scanningAngle` variable). This gives full 360-degree coverage with no diagonal blind spots.
+**Important:** each LiDAR sensor's FOV must be **90 degrees**. The Lua script under each `lidarX` object sets this in `sysCall_init` (`scanningAngle` variable). Without 90° FOV, there are diagonal blind spots between sensors.
 
-## Usage
+## Quick Start
 
-### Generating the spawn map (one-time)
-
-Before training with randomized start poses, generate the safe-spawn map:
+### 1. Generate the spawn map (one-time per scene)
 
 ```bash
 python generate_spawn_map.py
 ```
 
-This sweeps the drone (frozen, flight script disabled) across the entire map at 0.5 m intervals, reads lidar at each position, and saves all obstacle-free positions to `spawn_map.npy`. Also creates `spawn_map_preview.txt` with a human-readable grid.
+Sweeps the drone (frozen, flight script disabled) across the map at 0.5 m intervals. Saves obstacle-free positions to `spawn_map.npy` and a human-readable grid to `spawn_map_preview.txt`. Must be regenerated if the scene layout changes.
 
-### Training
+### 2. Train
 
 ```bash
-python train.py
+python train.py --final-name my_run
 ```
 
-`train.py` auto-launches `NUM_ENVS` headless CoppeliaSim instances (16 by default), each bound to its own ZMQ port, and trains PPO against them in parallel. Checkpoints go to `./models/checkpoints/`, and the final model to `./models/drone_ppo_final.zip`. Monitor with TensorBoard:
+Launches `NUM_ENVS` headless CoppeliaSim instances and trains PPO. The model (`models/my_run.zip`) and VecNormalize stats (`stats/my_run_vecnormalize.pkl`) are saved every `SAVE_FREQ` steps and on completion/interrupt.
+
+Monitor training with TensorBoard:
 
 ```bash
 tensorboard --logdir ./logs/
 ```
 
-### Testing a trained model
+### 3. Evaluate
 
 ```bash
-python train.py --test
-python train.py --test --model models/checkpoints/drone_ppo_50000_steps
+python evaluate.py --model models/my_run --episodes 20
 ```
 
-### Resuming training
+Runs deterministic episodes (no exploration noise) with frozen VecNormalize stats. Reports per-episode reward, length, collision/OOB/timeout rates, and cells visited. Use `--compare` to evaluate multiple models side-by-side:
 
 ```bash
-python train.py --resume --model models/drone_ppo_final
-python train.py --resume --model models/checkpoints/drone_ppo_10000_steps
+python evaluate.py --compare models/my_run_v1 models/my_run_v2 --episodes 30
 ```
 
-**Important:** do *not* resume an old checkpoint after changing reward weights in `ENV_CONFIG`. PPO's value function is calibrated to the reward scale it was trained on; resuming into a different reward produces wildly incorrect advantages and the policy collapses. Retrain from scratch whenever you touch the reward.
-
-### Running on Palmetto (Clemson HPC)
+### 4. Compare training runs
 
 ```bash
-cd ~/rl_testing/CPSC4420-DroneNAV
-apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && python3 train.py --final-name drone_ppo_palmetto_v14"
+python compare_runs.py                       # all palmetto runs
+python compare_runs.py --pattern v14 v15     # specific versions
+python compare_runs.py --mode drift          # spot late-training collapse
 ```
 
-## How it works
+### 5. Test (quick single-episode demo)
+
+```bash
+python train.py --test --model models/my_run
+```
+
+### 6. Resume training
+
+```bash
+python train.py --resume --model models/my_run
+```
+
+**Important:** do *not* resume after changing reward weights or observation shape in `ENV_CONFIG`. The value function is calibrated to the reward scale it was trained on — resuming into a different configuration will collapse the policy. Retrain from scratch instead.
+
+## How It Works
 
 ### Observation (22D, normalized by VecNormalize)
 
@@ -86,176 +115,290 @@ apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && pyth
 | `[16:19]` | Drone world position (x, y, z) | m |
 | `[19:22]` | Drone linear velocity (vx, vy, vz) | m/s |
 
-Each sensor's 16×16 depth buffer (90-degree FOV) is split into 4 column bins, giving angular resolution of ~22.5 degrees per bin. The minimum valid depth in each bin is reported (readings below `0.01 m` are filtered out, max range is `5.0 m`). VecNormalize wraps the environment to normalize observations and rewards to zero-mean, unit-variance.
+Each sensor's 16×16 depth buffer (90° FOV) is split into 4 column bins (~22.5° per bin). The minimum valid depth per bin is reported (readings ≤ 0.01 m are filtered, max range is 5.0 m). `VecNormalize` wraps the environment to normalize observations and rewards to approximately zero-mean, unit-variance.
 
 ### Action (3D, continuous)
 
-`(dx, dy, dz)` in `[-1, 1]`, clipped and multiplied by `speed_scale`, then added to the target dummy's world position. The drone's built-in flight script chases the dummy. The `z` component is clamped to `[min_altitude, max_altitude]` so the policy can't cheat by climbing out of obstacle range.
+`(dx, dy, dz)` in `[-1, 1]`, clipped and multiplied by `speed_scale`, then added to the target dummy's world position. The drone's built-in PID flight script chases the dummy. The `z` component is clamped to `[min_altitude, max_altitude]`.
 
 ### Reward
 
-Every reward weight is configurable from `train.py`'s `ENV_CONFIG` — `drone_environment.py` exposes all of them as **required keyword-only arguments**, so forgetting to set one raises a `TypeError` instead of silently picking a default. This guarantees `train.py` is the single source of truth.
+All reward weights are configurable via `ENV_CONFIG` in `train.py`. The environment exposes them as **required keyword-only arguments** — forgetting one raises `TypeError`.
 
 | Term | Type | Purpose |
 |---|---|---|
 | `survival_reward` | per-step `+` | Reward for every step the episode continues |
-| `exploration_reward` | one-shot `+` | Bonus the first time the drone enters each 0.5 m grid cell |
-| `movement_reward` | per-step `+` | Reward when horizontal speed `> 0.1 m/s` (currently `0`) |
-| `altitude_bonus` | per-step `+` | Reward when within the altitude soft band |
-| `proximity_penalty` | per-step `−` | Quadratic in `(proximity_threshold − min_lidar)` |
-| `boundary_penalty` | per-step `−` | Linear ramp within `boundary_warning_distance` of map edges |
-| `stagnation_penalty` | per-step `−` | Accrues after camping in one cell for too long |
-| `altitude_penalty` | per-step `−` | Linear then quadratic outside the soft band |
-| `hovering_penalty` | per-step `−` | Penalty when horizontal speed `< 0.1 m/s` (currently `0`) |
-| `action_smoothness` | per-step `−` | `scale × ‖a_t − a_{t-1}‖²` to suppress twitchy output |
-| `collision_penalty` | terminal `−` | Triggered when `min_lidar < collision_distance` |
-| `out_of_bounds_penalty` | terminal `−` | Triggered when the drone leaves the flight volume |
+| `exploration_reward` | one-shot `+` | Bonus the first time the drone enters each 0.5 m grid cell (2D, x/y only) |
+| `altitude_bonus` | per-step `+` | Reward when altitude is within the soft band around ideal |
+| `proximity_penalty` | per-step `−` | Quadratic penalty when `min_lidar < proximity_threshold` |
+| `boundary_penalty` | per-step `−` | Linear ramp within `boundary_warning_distance` of x/y map edges |
+| `stagnation_penalty` | per-step `−` | Accrues after camping in one grid cell too long |
+| `altitude_penalty` | per-step `−` | Linear then quadratic outside the altitude soft band |
+| `action_smoothness` | per-step `−` | `scale × ‖a_t − a_{t-1}‖²` — suppresses twitchy output |
+| `movement_reward` | per-step `+` | Reward when horizontal speed > 0.1 m/s (currently `0.0`) |
+| `hovering_penalty` | per-step `−` | Penalty when horizontal speed < 0.1 m/s (currently `0.0`) |
+| `collision_penalty` | terminal `−` | Episode ends when `min_lidar < collision_distance` |
+| `out_of_bounds_penalty` | terminal `−` | Episode ends when drone leaves the flight volume |
 
-The reward has been deliberately rebalanced (see *Reward design notes* below) to remove the "fly a big perimeter circle forever" attractor that dominated earlier runs.
+### Episode Termination
 
-### Episode termination
+- **Terminated** (no value bootstrap): collision or out-of-bounds
+- **Truncated** (with value bootstrap): `step_count >= max_steps`
 
-- **Terminated** (no value bootstrap): collision (`min_lidar < collision_distance`) or out-of-bounds (position outside `[boundary_min, boundary_max]` on x/y or `[min_altitude, max_altitude]` on z).
-- **Truncated** (value bootstrap): `step_count >= max_steps`.
+## Project Structure
 
-### Training loop
-
-`train.py` uses stable-baselines3 PPO with a `[256, 256]` ReLU MLP and 16 `SubprocVecEnv` workers, each talking to its own CoppeliaSim instance over ZMQ. The vec env is wrapped in `VecNormalize` (obs + reward normalization) — stats are saved to `stats/{run_name}_vecnormalize.pkl` alongside the model. Default total budget is 500 k timesteps. Checkpoints are written every 10 k steps, and a "latest" model every 5 k steps so in-progress training is always recoverable. Start poses are randomized each episode using a pre-computed spawn map (`spawn_map.npy`).
-
-## Reward design notes
-
-The reward went through a ground-up rebalance after the original weights produced a "big perimeter circle" policy. This section documents what was changed and why, because the numbers in `ENV_CONFIG` don't explain themselves.
-
-### What the old reward optimized
-
-The previous reward had `movement_reward = +4.0/step` awarded for *any* horizontal speed above `0.1 m/s`, regardless of direction or displacement. On a 2000-step episode, this was worth up to `+8000` of episode reward — an order of magnitude larger than the collision penalty (`−60`) and more than triple the maximum possible exploration reward. The optimal policy had two phases:
-
-1. **Lap 1** (~570 steps): sweep the perimeter once, collecting ~400 new cells at `+20` each. Average reward per step `≈ +14.8`.
-2. **Laps 2+** (remaining ~1430 steps): keep looping the same perimeter. Exploration reward is zero (cells are one-shot), but `movement_reward + survival + altitude_bonus = +4.8/step` flows forever. No penalty because the interior (where the obstacles are) is avoided.
-
-Total episode reward: `~+17,560`. The policy was not "exploring" — it was running one efficient sweep and then farming the movement bonus.
-
-### What was changed
-
-| Term | Old | New | Why |
-|---|---|---|---|
-| `movement_reward` | `4.0` | `0.0` | Laps 2+ now pay nothing. The big circle is no longer profitable after the first lap. |
-| `proximity_threshold` | `1.0 m` | `0.4 m` | Narrowed so corridors ≥ 0.8 m wide are penalty-free, but still gives a push-back gradient starting 0.4 m from obstacles. |
-| `proximity_penalty_scale` | `3.5` (linear) | `25.0` (quadratic) | With the threshold tightened, the penalty scale was raised and the shape changed to `((threshold − d)/threshold)²` so near-collision is sharply punished. |
-| `hovering_penalty` | `1.0` | `0.0` | Removed alongside the movement bonus. Keeping it created a one-sided cliff at `speed = 0.1` with nothing on the other side — just noise for the value function to learn. |
-| `altitude_soft_band` | `0.3 m` | `0.5 m` | Widened so the drone has room to change altitude without penalty. |
-| `altitude_linear_scale` | `1.5` | `0.3` | Softened. The old value made altitude the dominant gradient in the reward. |
-| `altitude_quadratic_scale` | `3.0` | `0.5` | Same. |
-| `action_smoothness_scale` | — | `0.02` | New term: `0.02 × ‖a_t − a_{t-1}‖²`. Suppresses the "twitch in place to satisfy the speed threshold" reward-hack that could replace the big circle. |
-
-### Near-collision penalty profile
-
-With `proximity_threshold = 0.4 m`, `scale = 25`, quadratic, the per-step reward near obstacles looks like this (with the `+0.8/step` base from survival + altitude):
-
-| Lidar distance | Net reward/step | Interpretation |
-|---|---|---|
-| `≥ 0.40 m` | `+0.8` | Free zone — any corridor `≥ 0.8 m` wide is penalty-free |
-| `0.35 m` | `+0.6` | Mild warning |
-| `0.30 m` | `−0.75` | Moderate |
-| `0.25 m` | `−3.0` | Danger zone |
-| `0.15 m` | `−9.0` | Imminent collision |
-| `< 0.10 m` | `−60` + terminal | Collision, episode ends |
-
-### What this change does and doesn't fix
-
-**Does fix:** the reward landscape no longer pays for circling, oscillation, or ramming walls. Interior sweep is worth ~50 % more than the big perimeter circle. Near-collision is unambiguously negative for the first time.
-
-**Observability gap (unchanged):** dynamic pedestrians move, but the observation has no memory. The policy sees only the instantaneous distance to each obstacle, so it cannot form a velocity estimate and cannot predict where a pedestrian will be next step. This limits "predictive" avoidance to reflexive distance-based avoidance until the observation adds temporal context (frame stacking or a recurrent policy).
-
-## Structure
-
-| File | Description |
-|---|---|
-| `train.py` | PPO training / testing entry point. All tunable config (`ENV_CONFIG`, `PPO_CONFIG`, `EVAL_CONFIG`, launcher paths) lives at the top of the file. |
-| `drone_environment.py` | Gymnasium environment wrapping CoppeliaSim. All reward and env kwargs are required keyword-only — supplied by `train.py`. |
-| `lidar.py` | Reads depth data from 4 vision sensors with angular binning support. |
-| `navigation.py` | Position / velocity getters and target-dummy mover. |
-| `generate_spawn_map.py` | One-time script to sweep the map and generate `spawn_map.npy`. |
-| `spawn_map.npy` | Pre-computed Nx2 array of safe (x, y) spawn positions. |
-| `spawn_map_preview.txt` | Human-readable grid showing safe (.) and obstacle (X) positions. |
-| `CoppeliaSim Drone Follower.ttt` | The training scene. |
+```
+CPSC4420-DroneNAV/
+├── train.py                    # Training / testing entry point
+├── drone_environment.py        # Gymnasium environment wrapping CoppeliaSim
+├── lidar.py                    # LiDAR depth reader with angular binning
+├── navigation.py               # Position / velocity helpers, target-dummy mover
+├── evaluate.py                 # Post-training deterministic evaluation
+├── compare_runs.py             # TensorBoard run comparison tables
+├── generate_spawn_map.py       # One-time safe-spawn position sweep
+├── coppeliasim.def             # Apptainer container definition for Palmetto
+├── requirements.txt            # Python dependencies
+├── CoppeliaSim Drone Follower.ttt  # Training scene
+├── spawn_map.npy               # Pre-computed safe (x, y) spawn positions
+├── spawn_map_preview.txt       # Human-readable spawn map grid
+├── models/                     # Saved model weights (.zip)
+├── stats/                      # VecNormalize running statistics (.pkl)
+├── logs/                       # TensorBoard event files
+└── archive/                    # Pre-v6 artifacts (gitignored)
+```
 
 ## Configuration
 
-### Environment parameters (`ENV_CONFIG` in `train.py`)
+All configuration lives at the top of `train.py`. Values shown below are the current defaults.
+
+### Environment Parameters (`ENV_CONFIG`)
 
 | Parameter | Value | Description |
 |---|---|---|
 | `max_steps` | `2000` | Max steps per episode before truncation |
-| `speed_scale` | `0.1` | Multiplier applied to policy action before it's sent to the target dummy |
+| `speed_scale` | `0.1` | Multiplier from raw action to target-dummy displacement |
 | `collision_distance` | `0.1` | LiDAR distance (m) that triggers collision termination |
-| `proximity_threshold` | `0.4` | LiDAR distance (m) below which the proximity penalty applies |
+| `proximity_threshold` | `0.4` | Distance (m) below which proximity penalty applies |
 | `boundary_min` / `boundary_max` | `-9.0` / `9.0` | Flight volume x/y bounds (m) |
-| `min_altitude` / `max_altitude` | `0.3` / `3.0` | Allowed altitude range (m) |
+| `min_altitude` / `max_altitude` | `0.5` / `2.5` | Allowed altitude range (m) |
 | `flight_height` | `1.5` | Starting altitude on reset (m) |
 | `ideal_altitude` | `1.5` | Ideal cruising altitude (m) |
 | `exploration_grid_size` | `0.5` | Grid cell size for exploration tracking (m) |
-| `lidar_bins` | `4` | Angular bins per sensor (4 bins × 4 sensors = 16 features) |
+| `lidar_bins` | `4` | Angular bins per sensor (4 × 4 sensors = 16 features) |
 | `randomize_start_pose` | `True` | Random spawn from spawn map each reset |
-| `spawn_margin` | `2.0` | Inset from boundaries for fallback random sampling (m) |
 | `spawn_map_path` | `spawn_map.npy` | Pre-computed safe spawn positions |
-| `disable_visualization` | `True` | Disable sim display on reset (required for headless training) |
-| `lidar_resolution` | `16` | Vision sensor resolution (square) |
+| `lidar_resolution` | `16` | Vision sensor resolution (square, pixels) |
 
-### Reward weights (`ENV_CONFIG` in `train.py`)
+### Reward Weights (`ENV_CONFIG`)
 
 | Parameter | Value | Description |
 |---|---|---|
 | `survival_reward` | `0.3` | Per-step bonus for staying alive |
 | `exploration_reward` | `20.0` | One-shot bonus for visiting a new grid cell |
-| `movement_reward` | `0.0` | Per-step bonus when horizontal speed > 0.1 m/s (disabled) |
-| `stagnation_start` | `20` | Steps in one cell before stagnation penalty kicks in |
-| `stagnation_rate` | `0.3` | Per-step stagnation accrual after it starts |
-| `stagnation_cap` | `8.0` | Max stagnation penalty per step |
-| `proximity_penalty_scale` | `25.0` | Multiplier on the proximity penalty |
-| `proximity_penalty_quadratic` | `True` | Use quadratic shape `((T−d)/T)² × scale` |
+| `proximity_penalty_scale` | `25.0` | Quadratic proximity penalty multiplier |
 | `collision_penalty` | `60.0` | Terminal penalty for collision |
-| `out_of_bounds_penalty` | `50.0` | Terminal penalty for leaving the flight volume |
-| `hovering_penalty` | `0.0` | Per-step penalty when speed < 0.1 m/s (disabled) |
-| `altitude_bonus` | `0.5` | Bonus when within the altitude soft band |
-| `altitude_soft_band` | `0.5` | Half-width of the "free altitude" band (m) |
-| `altitude_linear_band` | `1.0` | Beyond this Δ, switch to quadratic penalty (m) |
-| `altitude_linear_scale` | `0.3` | Linear penalty slope inside the linear band |
-| `altitude_quadratic_scale` | `0.5` | Quadratic penalty slope outside the linear band |
+| `out_of_bounds_penalty` | `50.0` | Terminal penalty for leaving flight volume |
+| `altitude_bonus` | `0.5` | Bonus inside the altitude soft band |
+| `altitude_soft_band` | `0.5` | Half-width of the free-altitude zone (m) |
+| `altitude_linear_scale` | `1.0` | Linear altitude penalty slope |
+| `altitude_quadratic_scale` | `2.0` | Quadratic altitude penalty slope |
 | `action_smoothness_scale` | `0.02` | Penalty on `‖a_t − a_{t-1}‖²` |
 | `boundary_warning_distance` | `0.7` | Distance from edge where boundary penalty starts (m) |
-| `boundary_penalty_scale` | `2.0` | Multiplier on boundary proximity penalty |
+| `boundary_penalty_scale` | `2.0` | Boundary proximity penalty multiplier |
 
-### PPO hyperparameters (`PPO_CONFIG` in `train.py`)
+### PPO Hyperparameters (`PPO_CONFIG`)
 
 | Parameter | Value | Description |
 |---|---|---|
-| `learning_rate` | `3e-4` | Learning rate (Adam) |
-| `n_steps` | `256` | Steps per env per rollout (× 16 envs = 4096-sample rollouts) |
-| `batch_size` | `64` | Minibatch size for each gradient step |
-| `n_epochs` | `10` | PPO update epochs per rollout |
-| `gamma` | `0.995` | Discount factor (~200 step / 10 s planning horizon) |
+| `learning_rate` | `3e-4` | Adam learning rate |
+| `n_steps` | `256` | Steps per env per rollout (× `NUM_ENVS` = total samples) |
+| `batch_size` | `64` | Minibatch size per gradient step |
+| `n_epochs` | `5` | SGD passes over each rollout buffer |
+| `gamma` | `0.995` | Discount factor (~200-step effective horizon) |
 | `gae_lambda` | `0.95` | GAE lambda for advantage estimation |
 | `clip_range` | `0.2` | PPO clipping range |
-| `ent_coef` | `0.01` | Entropy coefficient |
+| `ent_coef` | `0.005` | Entropy bonus (exploration vs commitment) |
 | `vf_coef` | `0.5` | Value function loss weight |
 | `max_grad_norm` | `0.5` | Gradient clipping threshold |
-| `target_kl` | `0.025` | Stop update early if approx_kl exceeds this |
+| `target_kl` | `0.04` | Stop update early if approx KL exceeds this |
 
-### Training budget (`train.py` constants)
+### Training Constants
 
 | Constant | Value | Description |
 |---|---|---|
 | `TOTAL_TIMESTEPS` | `500_000` | Total training timesteps |
-| `CHECKPOINT_FREQ` | `10_000` | Save a versioned checkpoint every N steps |
-| `LATEST_SAVE_FREQ` | `5_000` | Overwrite the "latest" model every N steps |
-| `HIDDEN_LAYERS` | `[256, 256]` | Policy / value network architecture |
-| `NUM_ENVS` | `16` | Parallel CoppeliaSim instances |
-| `BASE_PORT` / `PORT_STRIDE` | `23000` / `2` | First ZMQ port and increment per instance |
+| `SAVE_FREQ` | `5_000` | Save model + stats every N steps |
+| `HIDDEN_LAYERS` | `[256, 256]` | Policy / value network architecture (ReLU MLP) |
+| `NUM_ENVS` | `16` | Parallel CoppeliaSim instances (set to 1 for local testing) |
 | `DEVICE` | `"cpu"` | Training device (`"cpu"`, `"cuda"`, or `"auto"`) |
 
-## Known limitations
+## Palmetto Cluster Setup (Clemson HPC)
 
-- **No temporal observation.** The policy has no memory, so it cannot predict pedestrian motion — only react to it. Fix: `VecFrameStack(k=4)` or switch to `RecurrentPPO`.
-- **Eval is disabled.** `EVAL_CONFIG["enabled"] = False`. There's no objective generalization metric in TensorBoard separate from training noise. Fix: enable the eval callback and wire up a dedicated eval env.
-- **LiDAR angular resolution.** Angular binning (4 bins per sensor) partially addresses bearing information, but finer resolution (8+ bins) or a learned encoder could improve obstacle localization further.
+Palmetto is Clemson's HPC cluster. Training runs on compute nodes inside an [Apptainer](https://apptainer.org/) container that bundles CoppeliaSim + all Python dependencies into a single portable file. This section walks through the complete setup from scratch.
+
+### What you need before starting
+
+- A Clemson account with Palmetto access
+- The project repo on GitHub (your fork or the main repo)
+- A local machine for viewing TensorBoard logs and testing models
+
+### Understanding the tools
+
+| Tool | What it is | Why we need it |
+|---|---|---|
+| **Open OnDemand** | Web portal for Palmetto (https://docs.rcd.clemson.edu/openod/) | Launch interactive sessions without SSH |
+| **Palmetto Desktop** | Full Linux desktop on a compute node (via OnDemand) | Run terminal commands, build containers, train |
+| **Code Server** | VSCode in the browser (via OnDemand) | Edit files on Palmetto — but can't run `apptainer` commands |
+| **Apptainer** | Container runtime (like Docker but for HPC) | Packages CoppeliaSim + Python into a portable `.sif` file |
+| `coppeliasim.def` | Container recipe (in the repo) | Tells Apptainer what to download and install |
+| `coppeliasim.sif` | Built container (~1–2 GB) | The actual portable environment — run training inside this |
+
+### Step 1: Launch a Palmetto Desktop
+
+1. Go to [Open OnDemand](https://docs.rcd.clemson.edu/openod/)
+2. Click **Interactive Apps → Palmetto Desktop**
+3. Set these parameters:
+
+   | Parameter | Value | Why |
+   |---|---|---|
+   | Partition | `work1` | General compute |
+   | CPU cores | **20** | ~1–2 cores per CoppeliaSim instance |
+   | Memory | **64–80 GB** | ~2 GB per instance × 16 instances + overhead |
+   | GPUs | **0** | Not needed — bottleneck is CoppeliaSim physics |
+   | Hours | **3–4** (setup) or **12+** (training) | Container build is one-time; training duration depends on `TOTAL_TIMESTEPS` and `NUM_ENVS` |
+
+4. Click **Launch** and wait for the session to start
+5. Click **Launch Palmetto Desktop** to open the Linux desktop
+6. Right-click the desktop → **Open Terminal**
+
+> **Important:** Do NOT use Code Server for terminal commands. It runs inside its own container where `apptainer` is not available. Use Code Server only for editing files.
+
+### Step 2: Clone the repository
+
+```bash
+mkdir -p ~/rl_testing && cd ~/rl_testing
+git clone https://github.com/YOUR_USERNAME/CPSC4420-DroneNAV.git
+cd CPSC4420-DroneNAV
+```
+
+### Step 3: Build the Apptainer container (one-time)
+
+```bash
+apptainer build --fakeroot coppeliasim.sif coppeliasim.def
+```
+
+This downloads Ubuntu 24.04, CoppeliaSim V4.10.0, PyTorch, stable-baselines3, and all other dependencies, then packages them into `coppeliasim.sif`.
+
+- `--fakeroot` lets you build without root access (available on Palmetto)
+- You only need to rebuild if you change `coppeliasim.def` or need to update packages
+- The `.sif` file is ~1–2 GB — do NOT commit it to git
+
+**Verify it worked:**
+
+```bash
+apptainer exec coppeliasim.sif xvfb-run /opt/coppeliasim/coppeliaSim -h 2>&1 | head -20
+```
+
+You should see:
+```
+[CoppeliaSim:loadinfo]   simulator launched.
+[CoppeliaSim:loadinfo]   plugin 'RemoteApi': load succeeded.
+```
+
+### Step 4: Generate the spawn map (one-time per scene)
+
+```bash
+apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && python3 generate_spawn_map.py"
+```
+
+- `-B $PWD:/workspace` makes your project folder visible inside the container at `/workspace`
+- Creates `spawn_map.npy` and `spawn_map_preview.txt`
+- Only needs to be regenerated if the scene layout changes
+
+### Step 5: Configure training
+
+Before your first training run, update `NUM_ENVS` in `train.py` to match your core count (16 is recommended for 20 cores). Set `TOTAL_TIMESTEPS` to your desired training budget.
+
+### Step 6: Run training
+
+```bash
+apptainer exec -B $PWD:/workspace coppeliasim.sif bash -c "cd /workspace && python3 train.py --final-name drone_ppo_palmetto_v1"
+```
+
+**What happens:**
+1. `train.py` auto-launches 16 headless CoppeliaSim instances (each wrapped in `xvfb-run`)
+2. PPO collects experience from all 16 environments in parallel
+3. Model + VecNormalize stats are saved every 5,000 steps
+4. TensorBoard logs are written to `logs/{run_name}/`
+
+**To interrupt gracefully:** press `Ctrl+C` once. The model will be saved before shutdown.
+
+### Step 7: Push results to Git
+
+After training completes, commit and push the outputs so you can view them on your local machine:
+
+```bash
+cd ~/rl_testing/CPSC4420-DroneNAV
+
+# Stage the training outputs
+git add models/drone_ppo_palmetto_v1.zip
+git add stats/drone_ppo_palmetto_v1_vecnormalize.pkl
+git add -f logs/drone_ppo_palmetto_v1_1/   # -f because logs/ is gitignored
+
+# Commit and push
+git commit -m "Training run: drone_ppo_palmetto_v1 (500K steps)"
+git push
+```
+
+> **Note:** `logs/` and `stats/` are in `.gitignore` to prevent accidental commits during development. Use `git add -f` to force-add specific run outputs you want to share.
+
+### Step 8: View results on your local machine
+
+On your local machine, pull the results:
+
+```bash
+git pull
+```
+
+**View TensorBoard logs:**
+```bash
+tensorboard --logdir ./logs/
+```
+Open http://localhost:6006 in your browser.
+
+**Compare training runs:**
+```bash
+python compare_runs.py
+```
+
+**Evaluate a model** (requires CoppeliaSim running locally):
+```bash
+python evaluate.py --model models/drone_ppo_palmetto_v1 --episodes 20
+```
+
+### Resource reference
+
+| What | How much | Notes |
+|---|---|---|
+| RAM per CoppeliaSim instance | ~2 GB | 16 instances ≈ 30 GB |
+| CPU per instance | ~1–2 cores | Scale `NUM_ENVS` to match available cores |
+| GPU | Not needed | PPO MLP is tiny; CoppeliaSim is CPU-only |
+| Container size | ~1–2 GB | Do not commit to git |
+
+## Known Limitations
+
+- **No temporal observation.** The policy sees only the current timestep — no memory. It cannot predict pedestrian velocity, only react to instantaneous distance. Fix: `VecFrameStack(k=4)` or `RecurrentPPO`.
+- **LiDAR angular resolution.** 4 bins per sensor (~22.5° each) partially addresses bearing info but finer resolution could improve obstacle localization.
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---|---|---|
+| Training hangs on startup | CoppeliaSim already running on same port | Close existing instances or change `BASE_PORT` |
+| `The paging file is too small` | Not enough RAM for `NUM_ENVS` instances | Reduce `NUM_ENVS` (each uses ~2 GB) |
+| `spawn_map.npy` not found | Spawn map not generated | Run `python generate_spawn_map.py` with CoppeliaSim open |
+| `TypeError: missing keyword argument` | `ENV_CONFIG` missing a required param | Add the missing key to `ENV_CONFIG` in `train.py` |
+| `approx_kl` rising throughout training | LR too high or `target_kl` too tight | Lower `learning_rate`, raise `target_kl`, or reduce `n_epochs` |
+| Model acts randomly when tested | VecNormalize stats not loaded | Ensure `stats/{name}_vecnormalize.pkl` exists alongside the model |
+| `apptainer: command not found` on Palmetto | Using Code Server instead of Palmetto Desktop | Switch to Palmetto Desktop for terminal commands |
+| Import hangs on Palmetto | Leftover CoppeliaSim processes from previous run | Cancel job and request a new node |
